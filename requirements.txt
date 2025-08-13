@@ -8,7 +8,7 @@ ollama==0.2.1
 gradio==4.32.0
 unstructured[md,docx,html,pdf]
 jq
-langchain-huggingface
+langchain-huggingface==0.0.4  # Pastikan ini ada
 fastapi
 uvicorn
 nvidia-cudnn-cu12==8.9.5.*
