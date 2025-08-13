@@ -1,0 +1,79 @@
+# Environment and virtualenv
+.venv/
+venv/
+env/
+
+# Chroma vector database
+chroma_db/
+
+# Python cache and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py.class
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Jupyter and IDE settings
+.ipynb_checkpoints/
+.idea/
+.vscode/
+*.code-workspace
+.history
+
+# Log files
+*.log
+logs/
+
+# Data files - exclude except structure
+docs/**/*.pdf
+docs/**/*.docx
+docs/**/*.xlsx
+docs/**/*.json
+docs/**/*.txt
+docs/**/*.html
+!docs/**/README.md  # Keep README files
+
+# Ollama models
+models/
+
+# Docker-compose override files
+docker-compose.override.yml
+
+# Environment variables
+.env
+.env.*
+secrets/
+
+# Unstructured cache
+.cache/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Ollama internal storage (if mounted locally)
+ollama_data/
+
+# Gradio temp files
+/gradio_tmp/
+
+# Large language models
+*.bin
+*.gguf
+*.safetensors
+
+# SQLite databases
+*.db
+*.sqlite3
+
+# Node.js artifacts (if any)
+node_modules/
+package-lock.json
+
+# Python packaging
+MANIFEST
