@@ -1,0 +1,14 @@
+langchain==0.2.1
+langchain-community==0.2.1
+chromadb==0.5.0
+sentence-transformers
+pypdf
+python-dotenv
+ollama==0.2.1
+gradio==4.32.0
+unstructured[md,docx,html,pdf]
+jq
+langchain-huggingface
+fastapi
+uvicorn
+nvidia-cudnn-cu12==8.9.5.*
