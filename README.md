@@ -1,20 +1,17 @@
-### File: README.md
+### RAG Programming Assistant 
 
 ```markdown
-# RAG Programming Assistant
+# RAG Programming Assistant - Experimental
 
-Proyek ini adalah sistem Retrieval-Augmented Generation (RAG) yang dioptimalkan untuk GPU, dirancang sebagai asisten programming pribadi. Sistem ini menggunakan Ollama untuk model bahasa dan ChromaDB untuk penyimpanan vektor, dengan antarmuka berbasis web menggunakan Gradio.
+Proyek ini adalah sistem Retrieval-Augmented Generation (RAG) yang dioptimalkan untuk GPU, 
+yangdirancang sebagai asisten programming pribadi. 
+Sistem ini menggunakan Ollama untuk model bahasa dan ChromaDB untuk penyimpanan vektor, 
+dengan antarmuka berbasis web menggunakan Gradio.
 
 ## Spesifikasi Sistem yang Direkomendasikan
 
-### Spesifikasi Minimum
-- **CPU**: Intel i5 atau AMD Ryzen 5 (generasi ke-8 atau lebih baru)
-- **RAM**: 16GB DDR4
-- **GPU**: NVIDIA GTX 1660 (6GB VRAM) atau setara
-- **Storage**: 50GB ruang kosong
-- **OS**: Ubuntu 22.04 LTS atau Windows 10/11 dengan WSL2
 
-### Spesifikasi Pengembangan (Contoh: Acer Nitro V 15)
+### Spesifikasi Pengembangan (Merk Laptop : Acer Nitro V 15)
 Berikut adalah spesifikasi laptop yang digunakan dalam pengembangan proyek ini:
 
 | Komponen | Spesifikasi |
@@ -25,15 +22,17 @@ Berikut adalah spesifikasi laptop yang digunakan dalam pengembangan proyek ini:
 | **RAM** | 64GB DDR5 (32GB + 32GB) |
 | **Storage** | 1TB NVMe SSD (Samsung 990 Pro) + Slot ekspansi tambahan |
 | **Display** | 15.6" IPS LCD 165Hz (1920x1080) |
-| **OS** | Ubuntu 24.04 LTS (dengan driver NVIDIA 535) |
+| **OS** | Ubuntu Pro 24.04 LTS (dengan driver NVIDIA 535) |
 | **Cooling** | Sistem pendingin ganda (Dual Fan) |
 | **Connectivity** | WiFi 6E, Bluetooth 5.3, 1x Thunderbolt 4 |
 | **Port** | HDMI 2.1, USB 3.2 Gen 2 (Type-C), 3x USB 3.2 Gen 1 |
 
 **Catatan Kinerja**:
 - GPU RTX 4060 (8GB) mampu menjalankan model hingga 16B parameter
-- Waktu inferensi: ~15 token/detik untuk deepseek-coder-v2:16b
-- Proses ingestion: ~3 menit untuk 1000 halaman dokumen
+- Waktu inferensi: ~15 token/detik untuk deepseek-coder-v2:16b & gemma3:12b-it-qat
+- Proses ingestion: ~45 detik untuk 1000 halaman dokumen 
+
+*Catatan: Tidak semua dokumen disertakan dalam repositori ini. Anda dapat memodifikasinya sesuai kebutuhan. Untuk contoh format dokumentasi, lihat folder "docs".*
 
 ## Fitur Utama
 1. **Multi-format Document Support**: 
