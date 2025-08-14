@@ -250,3 +250,35 @@ Untuk masalah teknis, buka [issue](https://github.com/username/rag-programming-a
 ---
 
 Dokumentasi ini memberikan panduan lengkap untuk setup, penggunaan, dan optimasi proyek pada berbagai spesifikasi hardware, dengan contoh detail untuk Acer Nitro V 15.
+
+
+## Berkat cara kita mengatur docker-compose.yml, prosesnya menjadi sangat mudah.
+
+Penjelasan Alur Kerja Update Dokumen
+Bagaimana Docker Tahu Ada File Baru? Di dalam file docker-compose.yml, untuk layanan ingest, kita memiliki baris ini:
+
+## volumes:
+  - ./docs:/app/docs
+Ini disebut volume mount. Artinya, folder docs di komputer Anda secara langsung "terhubung" ke folder /app/docs di dalam container ingest. Setiap kali Anda mengubah, menambah, atau menghapus file di folder docs Anda, container ingest akan langsung melihat perubahan tersebut. Anda tidak perlu membangun ulang (rebuild) image Docker hanya karena dokumennya berubah.
+
+Bagaimana Cara Menjalankan Ulang Proses Ingest? Anda hanya perlu menjalankan satu perintah untuk memberitahu Docker Compose agar menjalankan kembali layanan ingest (yang kemudian akan diikuti oleh restart otomatis aplikasi utama Anda).
+
+Langkah-Langkah untuk Update Dokumen
+Setiap kali Anda selesai mengubah isi folder docs, ikuti langkah ini:
+
+Buka terminal di root direktori proyek Anda.
+
+Jalankan perintah berikut:
+```bash
+docker-compose up -d --build
+```
+
+Apa yang dilakukan perintah ini?
+
+docker-compose up: Perintah ini akan memeriksa keadaan yang didefinisikan di docker-compose.yml.
+Ia akan melihat bahwa layanan ingest (yang hanya berjalan sekali) sudah dalam keadaan berhenti (exited).
+Ia akan menjalankan ulang layanan ingest. Layanan ini akan membaca ulang folder docs Anda yang sudah diperbarui dan meng-update database vektor di chroma_db.
+Setelah ingest selesai, docker-compose akan secara otomatis me-restart layanan rag-app karena ia bergantung pada ingest.
+Opsi --build adalah praktik yang baik untuk disertakan. Jika ada perubahan pada Dockerfile atau requirements.txt, ia akan membangun ulang image. Jika tidak ada, prosesnya akan sangat cepat.
+Opsi -d (detached) akan menjalankan semuanya di latar belakang.
+Dengan cara ini, alur kerja Anda untuk memperbarui "pengetahuan" AI Anda menjadi sangat sederhana: ubah dokumen, lalu jalankan docker-compose up -d --build.

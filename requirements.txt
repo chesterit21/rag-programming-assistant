@@ -1,14 +1,29 @@
-langchain==0.2.1
-langchain-community==0.2.1
-chromadb==0.5.0
-sentence-transformers
-pypdf
-python-dotenv
-ollama==0.2.1
-gradio==4.32.0
+# Core LangChain and RAG components
+langchain>=0.2.0,<0.3.0
+langchain-community>=0.2.0,<0.3.0
+langchain-huggingface>=0.0.3,<0.1.0
+chromadb>=0.5.0,<0.6.0
+langchain-chroma>=0.1.0,<0.2.0
+sentence-transformers>=2.7.0,<3.0.0
+
+# Document Loaders
 unstructured[md,docx,html,pdf]
-jq
-langchain-huggingface==0.0.4  # Pastikan ini ada
+pypdf>=4.2.0,<5.0.0
+jq>=1.7.0,<2.0.0
+
+# LLM and Web UI
+ollama>=0.2.0,<0.3.0
+gradio>=4.31.0,<5.0.0
 fastapi
 uvicorn
-nvidia-cudnn-cu12==8.9.5.*
+
+# Utilities
+python-dotenv>=1.0.0,<2.0.0
+
+# For GPU support, install torch separately based on your CUDA version.
+# The base torch library is a dependency of sentence-transformers and will be installed automatically.
+# To get full CUDA acceleration, install the correct version from PyTorch's official website.
+# Visit https://pytorch.org/get-started/locally/
+#
+# Example for CUDA 12.1 (run this command manually in your venv):
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121

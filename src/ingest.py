@@ -11,7 +11,7 @@ from langchain_community.document_loaders import (
 )
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 def load_documents(docs_dir):
     documents = []
@@ -36,11 +36,7 @@ def load_documents(docs_dir):
     for pattern, loader_class in file_types.items():
         for file_path in glob.glob(os.path.join(docs_dir, "**", pattern), recursive=True):
             try:
-                if loader_class == JSONLoader:
-                    loader = loader_class(file_path)
-                else:
-                    loader = loader_class(file_path)
-                
+                loader = loader_class(file_path)
                 docs = loader.load()
                 
                 for doc in docs:
@@ -86,14 +82,23 @@ def ingest_documents():
         encode_kwargs={'device': 'cuda', 'batch_size': 128}
     )
     
-    vector_db = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=os.path.join(current_dir, "../chroma_db"),
+    persist_directory = os.path.join(current_dir, "../chroma_db")
+    
+    print(f"💾 Initializing vector store at: {persist_directory}")
+    vector_db = Chroma(
+        persist_directory=persist_directory,
+        embedding_function=embeddings,
         collection_metadata={"hnsw:space": "cosine"}
     )
     
-    print(f"💾 Persisted vector store with {len(chunks)} chunks in chroma_db")
+    # Generate deterministic IDs for each chunk to enable upserting.
+    # This prevents duplicates and allows updating existing documents.
+    chunk_ids = [f"{chunk.metadata['source_path']}_{i}" for i, chunk in enumerate(chunks)]
+    
+    print(f"➕ Adding/updating {len(chunks)} chunks in the vector store...")
+    vector_db.add_documents(documents=chunks, ids=chunk_ids)
+    
+    print("✅ Ingestion complete.")
 
 if __name__ == "__main__":
     ingest_documents()

@@ -3,6 +3,7 @@ version: '3.8'
 services:
   ollama:
     image: ollama/ollama:latest
+    container_name: SFCore-Ollama
     deploy:
       resources:
         reservations:
@@ -14,11 +15,30 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    tty: true
+    restart: unless-stopped
+
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: SFCore-Ingest
+    runtime: nvidia
     environment:
-      - OLLAMA_GPU_LAYERS=50
+      - NVIDIA_VISIBLE_DEVICES=all
+      - EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./docs:/app/docs
+    command: ["python3", "src/ingest.py"]
+    depends_on:
+      - ollama
 
   rag-app:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: SFCore-Assistant
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -26,12 +46,15 @@ services:
       - EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
     volumes:
       - ./chroma_db:/app/chroma_db
-      - ./docs:/app/docs
     ports:
       - "7860:7860"
+    command: ["python3", "src/app.py"]
     depends_on:
+      ingest:
+        condition: service_completed_successfully
       ollama:
         condition: service_started
+    restart: unless-stopped
 
 volumes:
   ollama_data:
