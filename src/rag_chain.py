@@ -1,137 +1,306 @@
 import os
+import torch
+import tiktoken
 from dotenv import load_dotenv
 from langchain_community.llms import Ollama
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from sentence_transformers import CrossEncoder
+from typing import List, Dict, Tuple
 
+# --- Manajemen Konfigurasi Terpusat ---
 load_dotenv()
 
-def setup_rag_chain(
-    temperature: float = 0.2,
-    max_tokens: int = 4096,
-    gpu_layers: int = 35
-):
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    persist_dir = os.path.join(current_dir, "../chroma_db")
+class RAGConfig:
+    """Menyimpan semua konfigurasi untuk sistem RAG."""
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
-    embeddings = HuggingFaceEmbeddings(
-        model_name=os.getenv('EMBEDDING_MODEL', 'BAAI/bge-large-en-v1.5'),
-        model_kwargs={'device': 'cuda'}
-    )
+    # Konfigurasi Model Embedding Ganda
+    DB_DIRS = {
+        "bge_code": os.path.join(ROOT_DIR, "chroma_db_bge_code"),
+        "sfr_code": os.path.join(ROOT_DIR, "chroma_db_sfr_code")
+    }
+    EMBEDDING_MODELS = {
+        "bge_code": "BAAI/bge-code-v1",
+        "sfr_code": "Salesforce/SFR-Embedding-Code-2B_R"
+    }
+    EMBEDDING_DEVICE = "cpu"
+
+    # Konfigurasi Reranker
+    CROSS_ENCODER_MODEL = 'BAAI/bge-reranker-base'
+    CROSS_ENCODER_DEVICE = "cpu"
+
+    # Konfigurasi LLM
+    OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "codegemma:7b-instruct-q4_K_M")
+    CODEGEMMA_CONTEXT_SIZE = 8192
+
+    # Konfigurasi Proses Retrieval
+    RETRIEVER_SEARCH_TYPE = "similarity"
+    INITIAL_K = 20 # Ambil 20 dari setiap retriever
+    TOP_N_RERANKED = 10 # Ambil 10 teratas setelah reranking
+
+    # Deskripsi tugas untuk query embedding
+    TASK_DESCRIPTION = "Given a code snippet, retrieve relevant code snippets."
+
+    # --- Template Prompt ---
+    PROMPT_QUESTION_REWRITE_ID = """
+[INST] <<SYS>>
+Anda adalah AI yang bertugas mengubah pertanyaan lanjutan menjadi pertanyaan yang berdiri sendiri.
+Berdasarkan riwayat percakapan dan pertanyaan lanjutan, tulis ulang pertanyaan lanjutan tersebut agar menjadi pertanyaan yang lengkap dan bisa dipahami tanpa konteks percakapan sebelumnya.
+<</SYS>>
+
+RIWAYAT PERCAKAPAN:
+{chat_history}
+
+PERTANYAAN LANJUTAN:
+{question}
+
+PERTANYAAN LENGKAP HASIL PERUBAHAN:
+[/INST]"""
+
+    PROMPT_WITH_CONTEXT_ID = """
+[INST] <<SYS>>
+Anda adalah asisten pemrograman ahli bernama SFCore-Assistant.
+Gunakan dokumen konteks yang diambil berikut ini DAN riwayat percakapan sebelumnya untuk menjawab pertanyaan pengguna saat ini.
+Jawaban Anda harus teknis, detail, dan diformat dalam Markdown.
+Sebelum memberikan jawaban utama, pastikan jawaban masih relevan dengan riwayat percakapan sebelumnya untuk menjawab pertanyaan pengguna saat ini.
+Jawaban anda harus menggunakan bahasa indonesia walaupun pengguna bertanya dalam bahasa inggris.
+Jika konteks tidak berisi jawaban, sebutkan bahwa Anda tidak tahu dan jangan mengarang informasi.
+Setelah jawaban utama Anda, Anda WAJIB mengutip sumber yang Anda gunakan dari konteks. Cantumkan di bawah bagian '## 📚 Sumber', dengan mereferensikan 'source_path' dari metadata.
+<</SYS>>
+
+---
+RIWAYAT PERCAKAPAN SEBELUMNYA:
+{chat_history}
+---
+KONTEKS DOKUMEN:
+{context}
+---
+
+PERTANYAAN SAAT INI:
+{question}
+
+JAWABAN:
+[/INST]"""
+
+    PROMPT_NO_CONTEXT_ID = """
+[INST] <<SYS>>
+Anda adalah asisten pemrograman ahli bernama SFCore-Assistant.
+Jawab pertanyaan pengguna berdasarkan pengetahuan umum Anda sebagai seorang ahli, dengan mempertimbangkan riwayat percakapan sebelumnya.
+Jawaban Anda harus teknis, detail, dan diformat dalam Markdown.
+Jawaban anda harus menggunakan bahasa indonesia walaupun pengguna bertanya dalam bahasa inggris.
+<</SYS>>
+
+---
+RIWAYAT PERCAKAPAN SEBELUMNYA:
+{chat_history}
+---
+
+PERTANYAAN SAAT INI:
+{question}
+
+JAWABAN:
+[/INST]"""
+
+config = RAGConfig()
+print(f"Running on device: {config.DEVICE}")
+
+class RAGSystem:
+    """Mengelola semua komponen RAG dan memuat model saat dibutuhkan."""
+    def __init__(self, cfg: RAGConfig):
+        self.config = cfg
+        self.vector_dbs: Dict[str, Chroma] = {}
+        self.embeddings: Dict[str, HuggingFaceEmbeddings] = {}
+        self.cross_encoder = None
+        self.llm = None
+        self.tokenizer = None
+        self.prompt_with_context = None
+        self.prompt_no_context = None
+        self.prompt_question_rewrite = None
+
+    def _initialize_tokenizer(self):
+        if self.tokenizer is None:
+            print("Initializing tokenizer for context management...")
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+
+    def _initialize_embeddings(self):
+        if not self.embeddings:
+            print("Initializing embedding models...")
+            for key, model_name in self.config.EMBEDDING_MODELS.items():
+                print(f" -> Loading model: {model_name} on {self.config.EMBEDDING_DEVICE}")
+                self.embeddings[key] = HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={
+                        'device': self.config.EMBEDDING_DEVICE,
+                        'trust_remote_code': True
+                    }
+                )
+
+    def _initialize_vectordbs(self):
+        if not self.vector_dbs:
+            self._initialize_embeddings()
+            print("Loading vector databases...")
+            for key, db_dir in self.config.DB_DIRS.items():
+                if not os.path.exists(db_dir):
+                    raise FileNotFoundError(f"Vector DB not found for '{key}' at {db_dir}. Run ingest.py.")
+                self.vector_dbs[key] = Chroma(persist_directory=db_dir, embedding_function=self.embeddings[key])
+
+    def _initialize_cross_encoder(self):
+        if self.cross_encoder is None:
+            print(f"Initializing Cross-Encoder on {self.config.CROSS_ENCODER_DEVICE}...")
+            self.cross_encoder = CrossEncoder(self.config.CROSS_ENCODER_MODEL, device=self.config.CROSS_ENCODER_DEVICE)
+
+    def _initialize_llm_and_prompts(self, temperature, max_tokens, gpu_layers):
+        if self.llm is None:
+            effective_gpu_layers = gpu_layers if self.config.DEVICE == "cuda" else 0
+            self.llm = Ollama(
+                base_url=self.config.OLLAMA_BASE_URL,
+                model=self.config.OLLAMA_MODEL,
+                temperature=temperature,
+                num_ctx=max_tokens,
+                num_gpu=effective_gpu_layers,
+                stop=["<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>", "<|reserved_special_token>"]
+            )
+        
+        if self.prompt_with_context is None:
+            self.prompt_with_context = PromptTemplate(
+                template=self.config.PROMPT_WITH_CONTEXT_ID,
+                input_variables=["chat_history", "context", "question"]
+            )
+        
+        if self.prompt_no_context is None:
+            self.prompt_no_context = PromptTemplate(
+                template=self.config.PROMPT_NO_CONTEXT_ID,
+                input_variables=["chat_history", "question"]
+            )
+
+        if self.prompt_question_rewrite is None:
+            self.prompt_question_rewrite = PromptTemplate(
+                template=self.config.PROMPT_QUESTION_REWRITE_ID,
+                input_variables=["chat_history", "question"]
+            )
+
+rag_system = RAGSystem(config)
+
+def _format_history(chat_history: List[List[str]]) -> str:
+    if not chat_history:
+        return "Tidak ada riwayat percakapan."
+    buffer = [f"Pengguna: {user_msg}\nAsisten: {ai_msg}" for user_msg, ai_msg in chat_history]
+    return "\n".join(buffer)
+
+def _rewrite_question_with_history(question: str, chat_history_str: str) -> str:
+    if not chat_history_str or chat_history_str == "Tidak ada riwayat percakapan.":
+        return question
+
+    prompt = rag_system.prompt_question_rewrite.format(chat_history=chat_history_str, question=question)
     
-    vector_db = Chroma(
-        persist_directory=persist_dir,
-        embedding_function=embeddings
-    )
+    print(f"\n---✍️  Merevisi Pertanyaan---")
+    print(f"Pertanyaan Asli: {question}")
     
-    prompt_template = """
-    [INST] <<SYS>>
-    Anda adalah asisten programming ahli. Gunakan konteks berikut untuk menjawab pertanyaan.
+    rewritten_question = rag_system.llm.invoke(prompt).strip()
     
-    Aturan:
-    1. Berikan jawaban teknis dengan contoh kode jika relevan
-    2. Format jawaban dalam Markdown
-    3. Jika tidak tahu, jangan memaksakan jawaban
-    4. Referensikan sumber jika tersedia
-    <</SYS>>
+    print(f"Pertanyaan Revisi: {rewritten_question}")
+    print("---------------------------\n")
     
-    Konteks: {context}
-    
-    Pertanyaan: {question} 
-    
-    Jawaban:
-    [/INST]
-    """
-    
-    PROMPT = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"]
-    )
-    
-    llm = Ollama(
-        base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434'),
-        model=os.getenv("OLLAMA_MODEL", "gemma3:12b-it-qat"),
-        temperature=temperature,
-        num_ctx=max_tokens,
-        num_gpu=gpu_layers
-    )
-    
-    qa_chain = RetrievalQA.from_chain_type(
-        llm,
-        retriever=vector_db.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": 7, "fetch_k": 20}
-        ),
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=True
-    )
-    
-    return qa_chain
+    return rewritten_question
+
+def _rrf_fuse(results: List[List[any]], k=60) -> List[any]:
+    """Menggabungkan hasil pencarian menggunakan Reciprocal Rank Fusion (RRF)."""
+    fused_scores = {}
+    for docs in results:
+        for rank, doc in enumerate(docs):
+            doc_id = doc.page_content
+            if doc_id not in fused_scores:
+                fused_scores[doc_id] = {"score": 0, "doc": doc}
+            fused_scores[doc_id]["score"] += 1 / (rank + k)
+
+    reranked_results = sorted(fused_scores.values(), key=lambda x: x["score"], reverse=True)
+    return [item["doc"] for item in reranked_results]
+
+def rerank_documents(query: str, docs: List) -> List:
+    if not docs:
+        return []
+    rag_system._initialize_cross_encoder()
+    model_inputs = [[query, doc.page_content] for doc in docs]
+    scores = rag_system.cross_encoder.predict(model_inputs)
+    doc_scores = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+    top_n = rag_system.config.TOP_N_RERANKED
+    reranked_docs = [doc for doc, score in doc_scores[:top_n]]
+    print(f"\n=== 🏆 Re-ranked Sources (Top {top_n}) ===")
+    for i, (doc, score) in enumerate(doc_scores[:top_n]):
+        source_path = doc.metadata.get('source_path', 'Unknown')
+        print(f"{i+1}. {source_path} [Relevance Score: {score:.4f}]")
+    return reranked_docs
+
+def _build_context(docs: List, max_tokens: int) -> str:
+    """Membangun string konteks yang tidak melebihi batas token."""
+    rag_system._initialize_tokenizer()
+    context_text = ""
+    total_tokens = 0
+
+    for doc in docs:
+        doc_content = f"Source: {doc.metadata.get('source_path', 'N/A')}\n\n{doc.page_content}"
+        doc_tokens = len(rag_system.tokenizer.encode(doc_content))
+        
+        if total_tokens + doc_tokens > max_tokens:
+            break
+            
+        context_text += "\n\n---\n\n" + doc_content
+        total_tokens += doc_tokens
+        
+    return context_text
 
 def query_rag(
     question: str,
-    category: str | None = None,
-    temperature: float = 0.2,
-    max_tokens: int = 4096,
+    chat_history: List[List[str]],
+    temperature: float = 0.1,
+    max_tokens: int = 8192,
     gpu_layers: int = 35
 ):
-    # Setup chain dengan parameter yang diterima, bukan dari env var
-    rag_chain = setup_rag_chain(temperature, max_tokens, gpu_layers)
-
-    if category and category.strip():
-        categories = [c.strip() for c in category.replace('&', ',').replace(' ', ',').split(',') if c.strip()]
-        if len(categories) == 1:
-            rag_chain.retriever.search_kwargs["filter"] = {"category": categories[0]}
-            print(f"🔍 Filtering documents by category: {categories[0]}")
-        elif len(categories) > 1:
-            or_filter = {"$or": [{"category": cat} for cat in categories]}
-            rag_chain.retriever.search_kwargs["filter"] = or_filter
-            print(f"🔍 Filtering documents by categories (OR): {', '.join(categories)}")
-
-    # Langkah 1: Beri tahu UI bahwa pencarian sedang berlangsung
-    yield "🔍 Mencari dokumen relevan..."
-
-    # Langkah 2: Lakukan pengambilan dokumen (retrieval) secara manual
-    retriever = rag_chain.retriever
-    docs = retriever.invoke(question)
+    """Alur kerja RAG lengkap dengan dual retrieval, RRF, reranking, dan manajemen konteks."""
+    rag_system._initialize_llm_and_prompts(temperature, max_tokens, gpu_layers)
     
-    # Cetak sumber ke konsol untuk debugging
-    print("\n\n=== 🔗 Sources ===")
-    for i, doc in enumerate(docs):
-        source_path = doc.metadata.get('source_path', 'Unknown')
-        doc_category = doc.metadata.get('category', 'general')
-        print(f"{i+1}. {source_path} [Category: {doc_category}]")
-
-    # Langkah 3: Beri tahu UI bahwa pembuatan jawaban dimulai
-    generating_message = "✍️ Menghasilkan jawaban..."
-    yield generating_message
-
-    # Langkah 4: Format prompt secara manual dan stream langsung dari LLM
-    context_text = "\n\n---\n\n".join([doc.page_content for doc in docs])
-    prompt = rag_chain.combine_documents_chain.llm_chain.prompt
-    llm = rag_chain.combine_documents_chain.llm_chain.llm
+    history_str = _format_history(chat_history)
+    rewritten_question = _rewrite_question_with_history(question, history_str)
     
-    final_prompt = prompt.format(context=context_text, question=question)
+    yield "🔍 Melakukan pencarian ganda..."
+    rag_system._initialize_vectordbs()
+    all_retrieved_docs = []
+    for key, vector_db in rag_system.vector_dbs.items():
+        if key == 'bge_code':
+            query_text = f'<instruct>{config.TASK_DESCRIPTION}\n<query>{rewritten_question}'
+        elif key == 'sfr_code':
+            query_text = f'Instruct: Given Code or Text, retrieval relevant content\nQuery: {rewritten_question}'
+        else:
+            query_text = rewritten_question
+
+        retriever = vector_db.as_retriever(search_kwargs={"k": config.INITIAL_K})
+        docs = retriever.invoke(query_text)
+        all_retrieved_docs.append(docs)
+        print(f" -> Ditemukan {len(docs)} dokumen dengan '{key}'.")
+
+    yield "🤝 Menggabungkan hasil pencarian (RRF)..."
+    fused_docs = _rrf_fuse(all_retrieved_docs)
+
+    yield "🎯 Melakukan peringkat ulang dokumen..."
+    reranked_docs = rerank_documents(rewritten_question, fused_docs)
+
+    yield "✍️ Menghasilkan jawaban..."
+    context_token_limit = int(config.CODEGEMMA_CONTEXT_SIZE * 0.8)
+    context_text = _build_context(reranked_docs, context_token_limit)
+
+    if not context_text:
+        final_prompt = rag_system.prompt_no_context.format(chat_history=history_str, question=question)
+    else:
+        final_prompt = rag_system.prompt_with_context.format(chat_history=history_str, context=context_text, question=question)
 
     full_response = ""
-    for chunk in llm.stream(final_prompt):
+    for chunk in rag_system.llm.stream(final_prompt):
         full_response += chunk
-        yield generating_message + "\n\n" + full_response
+        yield full_response
 
 if __name__ == "__main__":
-    question = "berikan contoh penggunaan konsep DDD dengan membuat satu Class Model dengan nama Guru. dengan bahasa pemrograman C#. Pastikan ada Validasi nya  dan imutable"
-    category = "ddd"
-    
-    print(f"❓ Query: {question}")
-    print(f"🗂️ Using category filter: {category}")
-    
-    # Fungsi sekarang adalah generator, jadi kita perlu mengulanginya untuk mendapatkan hasil
-    final_answer = ""
-    for response_part in query_rag(question, category):
-        print(response_part, end="", flush=True) # Simulasikan streaming ke konsol
-        final_answer = response_part
-
-    print("\n\n💡 Final Answer:")
-    print(final_answer)
+    pass

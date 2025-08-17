@@ -4,9 +4,9 @@
 ### JANGAN PERNAH PULL REPOSITORY DARI BRANCH INI.
 
 ## Teknologi Utama
-- **Ollama** (Model: deepseek-coder-v2:16b)
+- **Ollama** (Model AI Utama: codegemma:7b-instruct-q4_K_M)
 - **ChromaDB** (Vector Store)
-- **Hugging Face Embeddings** (bge-large-en-v1.5)
+- **Hugging Face Embeddings** (BAAI/bge-code-v1 & Salesforce/SFR-Embedding-Code-2B_R)
 - **LangChain** (RAG Framework)
 - **Gradio** (Web UI)
 - **Docker** (Containerization)

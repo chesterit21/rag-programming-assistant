@@ -28,13 +28,9 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS_DIR = os.path.join(ROOT_DIR, "docs")
 
 # --- Konfigurasi Multi-Embedding --- #
-# EMBEDDING_MODELS = {
-#     "bge_code": "BAAI/bge-code-v1",
-#     "sfr_code": "Salesforce/SFR-Embedding-Code-2B_R"
-# }
-
 EMBEDDING_MODELS = {
-    "sfr_code": "Salesforce/SFR-Embedding-Code-2B_R"
+    "bge_code": "BAAI/bge-code-v1"
+    #"sfr_code": "Salesforce/SFR-Embedding-Code-2B_R" #--tambahkan ini jika GPU kuat.
 }
 
 DB_DIRS = {
@@ -45,14 +41,14 @@ DB_DIRS = {
 # --- Konfigurasi Spesifik Model (UNTUK TUNING) --- #
 MODEL_SETTINGS = {
     "bge_code": {
-        "chunk_size": 1200, # Ukuran lebih kecil untuk model yang lebih besar
+        "chunk_size": 4096,
         "overlap_lines": 10,
-        "batch_size": 2,      # Ukuran batch lebih kecil untuk menghemat memori GPU
+        "batch_size": 2,
     },
     "sfr_code": {
-        "chunk_size": 4096, # Ukuran lebih kecil untuk model yang lebih besar (ori value :4096)
+        "chunk_size": 2048, # Ukuran lebih kecil untuk model yang lebih besar
         "overlap_lines": 10,
-        "batch_size": 2,      # Ukuran batch lebih kecil untuk menghemat memori GPU
+        "batch_size": 1,      # Ukuran batch lebih kecil untuk menghemat memori GPU
     }
 }
 
@@ -228,7 +224,11 @@ def ingest_documents():
                     batch_chunks = all_chunks[i:i + batch_size]
                     batch_ids = chunk_ids[i:i + batch_size]
                     print(f"  -> Upserting batch {i//batch_size + 1}/{(total_chunks + batch_size - 1)//batch_size}...")
-                    
+
+                    # Ekstrak konten dan metadata untuk metode upsert
+                    batch_documents = [chunk.page_content for chunk in batch_chunks]
+                    batch_metadata = [chunk.metadata for chunk in batch_chunks]
+
                     # Ekstrak konten dan metadata untuk metode upsert
                     batch_documents = [chunk.page_content for chunk in batch_chunks]
                     batch_metadata = [chunk.metadata for chunk in batch_chunks]
@@ -246,7 +246,6 @@ def ingest_documents():
                     print(f"  ❌ Failed to upsert batch {i//batch_size + 1}. Error: {e}")
                     # Anda bisa menambahkan logika di sini, misalnya mencatat log
                     # kegagalan untuk ditinjau nanti.
-            
             print(f"✅ Ingestion for mqodel '{model_key}' complete.")
 
         if model_key == 'bge_code':
@@ -292,7 +291,7 @@ def ingest_documents():
 
                 class ManualEmbedder:
                     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-                        encoded_input = tokenizer(texts, padding=True, truncation=True, max_length=32768, return_tensors='pt').to(DEVICE)
+                        encoded_input = tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(DEVICE)
                         with torch.no_grad():
                             model_output = model(**encoded_input)
                         sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
