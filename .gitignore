@@ -141,3 +141,7 @@ package-lock.json
 
 # Python packaging
 MANIFEST
+chroma_db_bge_code/5987972a-07ba-44db-a71a-141862db1f27/index_metadata.pickle
+chroma_db_sfr_code/9907db70-4897-4264-9dd0-e8f1e9a52414/index_metadata.pickle
+.gitignore
+prompt_build.txt
