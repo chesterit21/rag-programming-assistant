@@ -49,9 +49,9 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     # Daftar skrip yang akan dijalankan secara berurutan
+    # ingest.py already handles all models including bge-code, so ingest_bge_code.py is redundant.
     scripts_to_run = [
-        "ingest.py",
-        "ingest_bge_code.py"
+        "ingest.py"
     ]
 
     print("Memulai proses orkestrasi ingest embedding model...")
@@ -69,4 +69,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

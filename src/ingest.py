@@ -1,16 +1,27 @@
+# ingests.py
+
 import os
 import glob
 import torch
 import json
 import git
-import tempfile
 import functools
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Any, Iterator, Optional
-from tree_sitter import Language, Parser
-from tree_sitter_languages import get_language as get_tree_sitter_language
 
+# Tree-sitter (opsional, dengan fallback)
+TS_AVAILABLE = True
+try:
+    from tree_sitter import Language, Parser
+    from tree_sitter_languages import get_language as get_tree_sitter_language
+except Exception:
+    TS_AVAILABLE = False
+    Language = None
+    Parser = None
+    get_tree_sitter_language = None
+
+# LangChain & loaders
 from langchain.docstore.document import Document
 from langchain.text_splitter import MarkdownHeaderTextSplitter
 from langchain_community.document_loaders import (
@@ -18,7 +29,12 @@ from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader, UnstructuredExcelLoader, WebBaseLoader
 )
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+
+# ChromaDB (pakai client langsung agar bisa add embeddings precomputed)
+import chromadb
+from chromadb import PersistentClient
+
+# HF Transformers untuk manual embedder
 from transformers import AutoModel, AutoTokenizer
 
 # --- Konfigurasi & Deteksi Perangkat --- #
@@ -28,23 +44,52 @@ print(f"Running on device: {DEVICE}")
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS_DIR = os.path.join(ROOT_DIR, "docs")
 ERROR_DIR_ROOT = os.path.join(ROOT_DIR, "file_error_ingest")
+os.makedirs(ERROR_DIR_ROOT, exist_ok=True)
 
 # --- Konfigurasi Embedding --- #
 EMBEDDING_MODELS = {
-    "sfr_code": "Salesforce/SFR-Embedding-Code-2B_R"
+    "bge_m3":  "BAAI/bge-m3",
+    "bge_code": "BAAI/bge-code-v1",
+    "codebert": "microsoft/codebert-base",
 }
 
 DB_DIRS = {
-    "sfr_code": os.path.join(ROOT_DIR, "chroma_db_sfr_code")
+    "bge_m3":  os.path.join(ROOT_DIR, "chroma_db_bge_m3"),
+    "bge_code": os.path.join(ROOT_DIR, "chroma_db_bge_code"),
+    "codebert": os.path.join(ROOT_DIR, "chroma_db_codebert"),
 }
 
-# --- Konfigurasi Spesifik Model (UNTUK TUNING) --- #
 MODEL_SETTINGS = {
-    "sfr_code": {
+    # BGE-M3: Multi-lingual multi-function (text/code), context panjang
+    "bge_m3": {
         "chunk_size": 4096,
         "overlap_lines": 10,
-        "batch_size": 2,
-    }
+        "batch_size": 8,
+        "max_length": 8192,   # aman utk VRAM 8GB; bisa dinaikkan ke 16384 jika kuat
+        "pooling": "mean",
+        "normalize": True,
+        "distance": "cosine",
+    },
+    # BGE-CODE: fokus code, context 4k
+    "bge_code": {
+        "chunk_size": 4096,
+        "overlap_lines": 10,
+        "batch_size": 8,
+        "max_length": 4096,
+        "pooling": "mean",
+        "normalize": True,
+        "distance": "cosine",
+    },
+    # CodeBERT: 512 token limit
+    "codebert": {
+        "chunk_size": 2048,
+        "overlap_lines": 5,
+        "batch_size": 16,
+        "max_length": 512,
+        "pooling": "mean",
+        "normalize": True,
+        "distance": "cosine",
+    },
 }
 
 # --- Pemecah Teks (Text Splitters) --- #
@@ -53,54 +98,24 @@ MARKDOWN_SPLITTER = MarkdownHeaderTextSplitter(
     strip_headers=False, return_each_line=False
 )
 
-# --- AST-based Code Chunker --- #
-def ast_chunker(
-    code: str,
-    language: Language,
-    max_chunk_size: int = 4096,
-    overlap_lines: int = 10
-) -> Iterator[Document]:
-    """Memecah kode menggunakan AST dan menyertakan overlap."""
-    parser = Parser()
-    parser.set_language(language)
-    tree = parser.parse(bytes(code, "utf8"))
-    
-    chunks = []
-    current_chunk_code = ""
-    
-    for node in tree.root_node.children:
-        node_code = node.text.decode("utf8")
-        
-        if len(current_chunk_code) + len(node_code) > max_chunk_size:
-            if current_chunk_code:
-                chunks.append(current_chunk_code)
-            current_chunk_code = node_code
-        else:
-            current_chunk_code += "\n" + node_code
-            
-    if current_chunk_code:
-        chunks.append(current_chunk_code)
-
-    overlapped_chunks = []
-    for i, chunk_text in enumerate(chunks):
-        metadata = {"start_line": 0}
-        if i > 0:
-            prev_chunk_lines = chunks[i-1].splitlines()
-            overlap = "\n".join(prev_chunk_lines[-overlap_lines:])
-            chunk_text = overlap + "\n" + chunk_text
-        
-        overlapped_chunks.append(Document(page_content=chunk_text, metadata=metadata))
-        
-    return overlapped_chunks
-
-# --- Pemuat & Pemroses Dokumen --- #
+# --- Loader mapping --- #
 LOADER_MAPPING = {
-    ".pdf": PyPDFLoader, ".json": lambda p: JSONLoader(p, jq_schema=".", text_content=False),
-    ".html": UnstructuredHTMLLoader, ".docx": UnstructuredWordDocumentLoader,
-    ".xlsx": UnstructuredExcelLoader, ".xls": UnstructuredExcelLoader,
-    ".md": TextLoader, ".txt": TextLoader, ".cs": TextLoader, ".vue": TextLoader,
-    ".py": TextLoader, ".js": TextLoader, ".ts": TextLoader, ".java": TextLoader,
-    ".cshtml": TextLoader, ".go": TextLoader,
+    ".pdf": PyPDFLoader,
+    ".json": lambda p: JSONLoader(p, jq_schema=".", text_content=False),
+    ".html": UnstructuredHTMLLoader,
+    ".docx": UnstructuredWordDocumentLoader,
+    ".xlsx": UnstructuredExcelLoader,
+    ".xls": UnstructuredExcelLoader,
+    ".md": TextLoader,
+    ".txt": TextLoader,
+    ".cs": TextLoader,
+    ".vue": TextLoader,
+    ".py": TextLoader,
+    ".js": TextLoader,
+    ".ts": TextLoader,
+    ".java": TextLoader,
+    ".cshtml": TextLoader,
+    ".go": TextLoader,
 }
 
 LANGUAGE_MAPPING = {
@@ -109,186 +124,335 @@ LANGUAGE_MAPPING = {
     ".md": "markdown", ".cshtml": "razor"
 }
 
-def get_git_metadata(repo: git.Repo, file_path: str) -> Dict[str, Any]:
-    """Mendapatkan metadata Git untuk sebuah file."""
+
+# ---------- Utilities ---------- #
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]  # (batch, seq_len, hidden)
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+    return sum_embeddings / sum_mask
+
+
+def build_manual_embedder(model_name: str, max_length: int, normalize: bool = True):
+    """
+    Manual embedder (GPU jika ada) untuk model HF apa pun yang output last_hidden_state (BERT/BGE).
+    """
+    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    torch_dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+    mdl = AutoModel.from_pretrained(model_name, torch_dtype=torch_dtype, trust_remote_code=True)
+    mdl.to(DEVICE)
+    mdl.eval()
+
+    class ManualEmbedder:
+        def __init__(self, tokenizer, model, max_len, do_norm):
+            self.tok = tokenizer
+            self.model = model
+            self.max_len = max_len
+            self.do_norm = do_norm
+
+        def embed_documents(self, texts: List[str]) -> List[List[float]]:
+            if not texts:
+                return []
+            # NOTE: untuk VRAM 8GB, batch kecil aman. batching di luar (caller)
+            enc = self.tok(
+                texts, padding=True, truncation=True,
+                max_length=self.max_len, return_tensors='pt'
+            ).to(DEVICE)
+            with torch.no_grad():
+                out = self.model(**enc)
+            sent = mean_pooling(out, enc['attention_mask'])
+            if self.do_norm:
+                sent = torch.nn.functional.normalize(sent, p=2, dim=1)
+            return sent.detach().cpu().numpy().tolist()
+
+        def embed_query(self, text: str) -> List[float]:
+            return self.embed_documents([text])[0]
+
+    return ManualEmbedder(tok, mdl, max_length, normalize)
+
+
+def get_git_metadata(repo: Optional[git.Repo], file_path: str) -> Dict[str, Any]:
     try:
-        repo_name = repo.remotes.origin.url.split('/')[-1].replace('.git', '')
-        last_commit = next(repo.iter_commits(paths=file_path, max_count=1))
+        if repo and repo.remotes:
+            origin_url = repo.remotes.origin.url if 'origin' in [r.name for r in repo.remotes] else ""
+        else:
+            origin_url = ""
+        repo_name = origin_url.split('/')[-1].replace('.git', '') if origin_url else "local"
+        last_commit = next(repo.iter_commits(paths=file_path, max_count=1)) if repo else None
         return {
             "repo_name": repo_name,
-            "last_commit_date": last_commit.committed_datetime.isoformat(),
-            "last_commit_author": last_commit.author.name,
+            "last_commit_date": (last_commit.committed_datetime.isoformat() if last_commit else ""),
+            "last_commit_author": (last_commit.author.name if last_commit else ""),
         }
     except Exception:
-        return {
-            "repo_name": "local",
-            "last_commit_date": "",
-            "last_commit_author": "",
-        }
+        return {"repo_name": "local", "last_commit_date": "", "last_commit_author": ""}
+
+
+def ast_chunker(
+    code: str,
+    language_name: Optional[str],
+    max_chunk_size: int = 4096,
+    overlap_lines: int = 10
+) -> Iterator[Document]:
+    """
+    AST-based chunker menggunakan tree-sitter bila tersedia, fallback ke line-based bila tidak.
+    """
+    if not TS_AVAILABLE or language_name is None:
+        # fallback: line-based chunking kasar
+        lines = code.splitlines()
+        chunks = []
+        current = []
+        current_len = 0
+        for ln in lines:
+            add = len(ln) + 1
+            if current_len + add > max_chunk_size and current:
+                chunks.append("\n".join(current))
+                current = [ln]
+                current_len = add
+            else:
+                current.append(ln)
+                current_len += add
+        if current:
+            chunks.append("\n".join(current))
+        # overlap
+        docs = []
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                prev_lines = chunks[i-1].splitlines()
+                overlap = "\n".join(prev_lines[-overlap_lines:])
+                chunk = overlap + "\n" + chunk
+            docs.append(Document(page_content=chunk, metadata={"start_line": 0}))
+        return iter(docs)
+
+    # Tree-sitter path
+    try:
+        if get_tree_sitter_language is None:
+            # Fallback if tree-sitter is not available
+            return ast_chunker(code, None, max_chunk_size, overlap_lines)
+        ts_lang = get_tree_sitter_language(language_name)
+    except Exception:
+        # Jika grammar tidak ada, fallback
+        return ast_chunker(code, None, max_chunk_size, overlap_lines)
+
+    if Parser is None:
+        # Fallback to line-based chunking if Parser is not available
+        return ast_chunker(code, None, max_chunk_size, overlap_lines)
+    parser = Parser()
+    parser.set_language(ts_lang)
+    tree = parser.parse(bytes(code, "utf8"))
+
+    chunks: List[str] = []
+    current_chunk_code = ""
+
+    for node in tree.root_node.children:
+        try:
+            node_code = node.text.decode("utf8")
+        except Exception:
+            continue
+        if len(current_chunk_code) + len(node_code) > max_chunk_size:
+            if current_chunk_code:
+                chunks.append(current_chunk_code)
+            current_chunk_code = node_code
+        else:
+            current_chunk_code += ("\n" if current_chunk_code else "") + node_code
+
+    if current_chunk_code:
+        chunks.append(current_chunk_code)
+
+    docs: List[Document] = []
+    for i, chunk_text in enumerate(chunks):
+        if i > 0:
+            prev_chunk_lines = chunks[i-1].splitlines()
+            overlap = "\n".join(prev_chunk_lines[-overlap_lines:])
+            chunk_text = overlap + "\n" + chunk_text
+        docs.append(Document(page_content=chunk_text, metadata={"start_line": 0}))
+    return iter(docs)
+
 
 def process_file(file_path: str, repo: Optional[git.Repo], chunk_size: int, overlap_lines: int) -> List[Document]:
-    """Memuat, memecah, dan memberi metadata pada satu file lokal."""
     try:
         ext = os.path.splitext(file_path)[1].lower()
         language_name = LANGUAGE_MAPPING.get(ext)
-        
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
 
+        # loader khusus beberapa tipe
+        if ext in (".pdf", ".json", ".html", ".docx", ".xlsx", ".xls"):
+            try:
+                LoaderCls = LOADER_MAPPING[ext]
+                loader = LoaderCls(file_path)
+                docs = loader.load()
+                content = "\n\n".join([d.page_content for d in docs if d.page_content])
+            except Exception as e:
+                print(f"❌ Loader gagal untuk {file_path}: {e}")
+                return []
+        else:
+            # text / code
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            except Exception as e:
+                print(f"❌ Gagal baca {file_path}: {e}")
+                return []
+
+        # Splitting
         if language_name and language_name not in ["markdown", "razor", "html", "css"]:
-            ts_language = get_tree_sitter_language(language_name)
-            chunks = ast_chunker(content, ts_language, max_chunk_size=chunk_size, overlap_lines=overlap_lines)
+            chunks = ast_chunker(content, language_name, max_chunk_size=chunk_size, overlap_lines=overlap_lines)
         elif language_name == "markdown":
             chunks = MARKDOWN_SPLITTER.split_text(content)
         else:
-            loader = TextLoader(file_path)
-            docs = loader.load()
-            chunks = [Document(page_content=doc.page_content, metadata=doc.metadata) for doc in docs]
+            # fallback: satu doc utuh
+            chunks = [Document(page_content=content, metadata={})]
 
         rel_path = os.path.relpath(file_path, ROOT_DIR)
         git_meta = get_git_metadata(repo, file_path) if repo else {}
-        
-        for chunk in chunks:
-            chunk.metadata.update({
+
+        out_docs: List[Document] = []
+        for ch in chunks:
+            if not ch or not getattr(ch, "page_content", None):
+                continue
+            md = getattr(ch, "metadata", {}) or {}
+            md.update({
                 "source_path": rel_path,
                 "language": language_name or "text",
                 **git_meta
             })
-        
-        print(f"✅ Processed and chunked: {rel_path}")
-        return chunks
+            out_docs.append(Document(page_content=ch.page_content, metadata=md))
+
+        print(f"✅ Processed and chunked: {rel_path} -> {len(out_docs)} chunks")
+        return out_docs
 
     except Exception as e:
         print(f"❌ Error processing {file_path}: {e}")
         return []
 
+
+def ensure_chromadb_collection(db_dir: str, collection_name: str, distance: str):
+    os.makedirs(db_dir, exist_ok=True)
+    client = chromadb.PersistentClient(path=db_dir)
+    # distance: "cosine" | "l2" | "ip"
+    col = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": distance})
+    return col
+
+
 def ingest_documents():
-    """Fungsi utama untuk menyerap semua dokumen dan membuat embedding."""
+    # Git repo untuk metadata
     try:
         repo = git.Repo(ROOT_DIR, search_parent_directories=True)
     except git.InvalidGitRepositoryError:
         print("⚠️ Not a git repository. Git metadata will not be available.")
         repo = None
 
+    # Kumpulkan file
     all_files = [p for p in glob.glob(os.path.join(DOCS_DIR, "**", "*"), recursive=True) if os.path.isfile(p)]
-    
+    if not all_files:
+        print(f"⚠️ Tidak ada file di {DOCS_DIR}.")
+        return
+
     for model_key, model_name in EMBEDDING_MODELS.items():
-        db_dir = DB_DIRS[model_key]
         settings = MODEL_SETTINGS[model_key]
+        db_dir = DB_DIRS[model_key]
         error_dir = os.path.join(ERROR_DIR_ROOT, model_key)
         os.makedirs(error_dir, exist_ok=True)
 
-        print(f"\n--- Processing for model: {model_name} with settings: {settings} ---")
+        print(f"\n=== Embedding model: {model_name} ({model_key}) ===")
+        print(f"Settings: {settings}")
 
-        # 1. Chunking
-        print(f"🚀 Starting parallel chunking for {model_key}...")
-        all_chunks = []
+        # 1) Chunking paralel
+        print(f"🚀 Chunking parallel untuk {model_key}...")
+        all_chunks: List[Document] = []
         process_file_args = {
             "chunk_size": settings["chunk_size"],
             "overlap_lines": settings["overlap_lines"]
         }
         process_func = functools.partial(process_file, repo=repo, **process_file_args)
-        
+
+        # NOTE: Tree-sitter bisa bermasalah di multiprocessing di beberapa OS;
+        # jika error, ubah ke ThreadPoolExecutor atau proses serial.
         with ProcessPoolExecutor() as executor:
-            future_to_file = {executor.submit(process_func, file_path): file_path for file_path in all_files}
-            for future in as_completed(future_to_file):
+            futures = {executor.submit(process_func, fp): fp for fp in all_files}
+            for fut in as_completed(futures):
                 try:
-                    all_chunks.extend(future.result())
+                    res = fut.result()
+                    if res:
+                        all_chunks.extend(res)
                 except Exception as e:
-                    print(f"❌ A worker process failed for {future_to_file[future]}: {e}")
-        
+                    print(f"❌ Worker gagal utk {futures[fut]}: {e}")
+
         if not all_chunks:
-            print(f"⚠️ No content could be chunked for model {model_key}. Skipping.")
+            print(f"⚠️ Tidak ada chunk untuk {model_key}. Skip.")
             continue
 
-        print(f"\n✅ Total chunks created for {model_key}: {len(all_chunks)}")
-        chunk_ids = [f"{chunk.metadata['source_path']}_{i}" for i, chunk in enumerate(all_chunks)]
+        print(f"✅ Total chunks: {len(all_chunks)}")
+        chunk_ids = [f"{d.metadata['source_path']}::{i}" for i, d in enumerate(all_chunks)]
 
-        # 2. Embedding
-        def process_with_embeddings(embeddings_object):
-            """Helper function to process chunks with a given embedding object."""
-            vector_db = Chroma(
-                persist_directory=db_dir,
-                embedding_function=embeddings_object,
-                collection_metadata={"hnsw:space": "cosine"}
-            )
-            total_chunks = len(all_chunks)
-            for i in range(0, total_chunks, settings["batch_size"]):
-                batch_chunks = all_chunks[i:i + settings["batch_size"]]
-                batch_ids = chunk_ids[i:i + settings["batch_size"]]
-                print(f"  -> Upserting batch {i//settings['batch_size'] + 1}/{(total_chunks + settings['batch_size'] - 1)//settings['batch_size']}...")
-                
-                batch_documents = [chunk.page_content for chunk in batch_chunks]
-                batch_metadata = [chunk.metadata for chunk in batch_chunks]
+        # 2) Siapkan collection ChromaDB
+        collection_name = f"{model_key}_collection"
+        collection = ensure_chromadb_collection(db_dir, collection_name, settings.get("distance", "cosine"))
 
-                try:
-                    batch_embeddings = embeddings_object.embed_documents(batch_documents)
-                    vector_db._collection.upsert(
-                        ids=batch_ids,
-                        documents=batch_documents,
-                        metadatas=batch_metadata,
-                        embeddings=batch_embeddings
-                    )
-                except Exception as e:
-                    print(f"  ❌ Failed to upsert batch {i//settings['batch_size'] + 1}. Error: {e}")
-                    print("  -> Copying problematic files for review...")
-                    for chunk in batch_chunks:
-                        source_path_rel = chunk.metadata.get("source_path")
-                        if source_path_rel:
-                            source_path_abs = os.path.join(ROOT_DIR, source_path_rel)
-                            dest_path = os.path.join(error_dir, os.path.basename(source_path_rel))
-                            try:
-                                shutil.copy2(source_path_abs, dest_path)
-                                print(f"    -> Copied {source_path_rel} to {dest_path}")
-                            except Exception as copy_e:
-                                print(f"    -> Failed to copy {source_path_rel}. Error: {copy_e}")
-            
-            print(f"✅ Ingestion for model '{model_key}' complete.")
-
-        if DEVICE == 'cuda':
-            print("   -> Using manual embedding for sfr_code with float16")
-            
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            model = AutoModel.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                trust_remote_code=True
-            ).to(DEVICE)
-
-            def mean_pooling(model_output, attention_mask):
-                token_embeddings = model_output[0]
-                input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-                sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-                return sum_embeddings / sum_mask
-
-            class ManualEmbedder:
-                def embed_documents(self, texts: List[str]) -> List[List[float]]:
-                    encoded_input = tokenizer(texts, padding=True, truncation=True, max_length=32768, return_tensors='pt').to(DEVICE)
-                    with torch.no_grad():
-                        model_output = model(**encoded_input)
-                    sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
-                    sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
-                    return sentence_embeddings.cpu().numpy().tolist()
-
-                def embed_query(self, text: str) -> List[float]:
-                    return self.embed_documents([text])[0]
-
-            embeddings = ManualEmbedder()
-            process_with_embeddings(embeddings)
-        else: # CPU for sfr_code
-            embeddings = HuggingFaceEmbeddings(
+        # 3) Siapkan embedder
+        if DEVICE == "cuda":
+            # Manual embedder untuk ketiga model
+            embedder = build_manual_embedder(
                 model_name=model_name,
-                model_kwargs={'device': DEVICE, 'trust_remote_code': True},
-                encode_kwargs={'normalize_embeddings': True, 'batch_size': settings["batch_size"]}
+                max_length=settings["max_length"],
+                normalize=settings.get("normalize", True)
             )
-            process_with_embeddings(embeddings)
+        else:
+            # CPU fallback: pakai LangChain HF Embeddings
+            embedder = HuggingFaceEmbeddings(
+                model_name=model_name,
+                model_kwargs={'device': 'cpu', 'trust_remote_code': True},
+                encode_kwargs={'normalize_embeddings': settings.get("normalize", True), 'batch_size': settings["batch_size"]}
+            )
 
-    print("\n🎉 All ingestions complete. Vector stores are ready.")
+        # 4) Upsert batched
+        total = len(all_chunks)
+        bs = settings["batch_size"]
+        for start in range(0, total, bs):
+            end = min(start + bs, total)
+            batch_docs = all_chunks[start:end]
+            batch_ids = chunk_ids[start:end]
+            texts = [d.page_content for d in batch_docs]
+            metas = [d.metadata for d in batch_docs]
 
+            print(f"  -> Upserting batch {start//bs + 1}/{(total + bs - 1)//bs} (size={len(texts)})")
+            try:
+                # Compute embeddings
+                if hasattr(embedder, "embed_documents"):
+                    vecs = embedder.embed_documents(texts)
+                else:
+                    # LangChain embedder fallback (should have embed_documents)
+                    vecs = embedder.embed_documents(texts)  # type: ignore
 
-print("Script top-level execution finished. Entering main block...", flush=True)
+                # Simpan ke ChromaDB
+                import numpy as np
+                embeddings_np = np.array(vecs, dtype=np.float32)
+                collection.add(
+                    ids=batch_ids,
+                    documents=texts,
+                    metadatas=metas,
+                    embeddings=embeddings_np
+                )
+            except Exception as e:
+                print(f"  ❌ Gagal upsert batch {start//bs + 1}: {e}")
+                print("  -> Menyalin file bermasalah untuk inspeksi...")
+                for d in batch_docs:
+                    src_rel = d.metadata.get("source_path")
+                    if src_rel:
+                        src_abs = os.path.join(ROOT_DIR, src_rel)
+                        dst = os.path.join(error_dir, os.path.basename(src_rel))
+                        try:
+                            if os.path.exists(src_abs):
+                                shutil.copy2(src_abs, dst)
+                                print(f"    -> Copied {src_rel} -> {dst}")
+                        except Exception as ce:
+                            print(f"    -> Gagal copy {src_rel}: {ce}")
+
+        print(f"✅ Ingestion selesai untuk model '{model_key}' ({model_name}).")
+
+    print("\n🎉 Semua ingestion selesai. Vector stores siap dipakai.")
+
 
 if __name__ == "__main__":
-    print("Inside main block. Calling ingest_documents()...", flush=True)
     ingest_documents()

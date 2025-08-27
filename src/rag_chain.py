@@ -19,12 +19,14 @@ class RAGConfig:
     
     # Konfigurasi Model Embedding Ganda
     DB_DIRS = {
+        "bge_m3": os.path.join(ROOT_DIR, "chroma_db_bge_m3"),
         "bge_code": os.path.join(ROOT_DIR, "chroma_db_bge_code"),
-        "sfr_code": os.path.join(ROOT_DIR, "chroma_db_sfr_code")
+        "codebert": os.path.join(ROOT_DIR, "chroma_db_codebert"),
     }
     EMBEDDING_MODELS = {
+        "bge_m3": "BAAI/bge-m3",
         "bge_code": "BAAI/bge-code-v1",
-        "sfr_code": "Salesforce/SFR-Embedding-Code-2B_R"
+        "codebert": "microsoft/codebert-base",
     }
     EMBEDDING_DEVICE = "cpu"
 
@@ -270,12 +272,7 @@ def query_rag(
     rag_system._initialize_vectordbs()
     all_retrieved_docs = []
     for key, vector_db in rag_system.vector_dbs.items():
-        if key == 'bge_code':
-            query_text = f'<instruct>{config.TASK_DESCRIPTION}\n<query>{rewritten_question}'
-        elif key == 'sfr_code':
-            query_text = f'Instruct: Given Code or Text, retrieval relevant content\nQuery: {rewritten_question}'
-        else:
-            query_text = rewritten_question
+        query_text = rewritten_question
 
         retriever = vector_db.as_retriever(search_kwargs={"k": config.INITIAL_K})
         docs = retriever.invoke(query_text)
