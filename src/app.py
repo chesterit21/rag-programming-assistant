@@ -18,7 +18,6 @@ def chat_interface(message: str, history: List[List[str]], category: str, temper
     response_generator = query_rag(
         question=message,
         chat_history=history_for_rag,
-        category=category,
         temperature=temperature,
         max_tokens=max_tokens,
         gpu_layers=gpu_layers

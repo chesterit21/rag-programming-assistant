@@ -27,7 +27,6 @@ async def handle_query(request: QueryRequest):
         # query_rag is a generator, we need to iterate over it
         for chunk_data in query_rag(
             question=request.question,
-            category=request.category,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             gpu_layers=request.gpu_layers
