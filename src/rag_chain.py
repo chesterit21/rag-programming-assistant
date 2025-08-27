@@ -27,7 +27,7 @@ class RAGConfig:
     EMBEDDING_MODELS = {
         "bge_m3": "BAAI/bge-m3",
         "bge_code": "BAAI/bge-code-v1",
-        "codebert": "microsoft/codebert-base",
+        "codebert": "jinaai/jina-embeddings-v2-base-code",
     }
     COLLECTION_NAMES = {
         "bge_m3": "bge_m3_collection",
@@ -42,14 +42,14 @@ class RAGConfig:
 
     # Konfigurasi LLM
     OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:0.6b-q4_K_M")
-    CODEGEMMA_CONTEXT_SIZE = 256000
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "codegemma:7b-instruct")
+    CODEGEMMA_CONTEXT_SIZE = 8000
 
 
     # Konfigurasi Proses Retrieval
     RETRIEVER_SEARCH_TYPE = "similarity"
-    INITIAL_K = 20 # Ambil 20 dari setiap retriever
-    TOP_N_RERANKED = 10 # Ambil 10 teratas setelah reranking
+    INITIAL_K = 15 # Ambil 20 dari setiap retriever
+    TOP_N_RERANKED = 15 # Ambil 20 teratas setelah reranking
 
     # Deskripsi tugas untuk query embedding
     TASK_DESCRIPTION = "Given a code snippet, retrieve relevant code snippets."
@@ -75,7 +75,7 @@ PERTANYAAN LENGKAP HASIL PERUBAHAN:
 Anda adalah asisten pemrograman ahli bernama SFCore-Assistant.
 Gunakan dokumen konteks yang diambil berikut ini DAN riwayat percakapan sebelumnya untuk menjawab pertanyaan pengguna saat ini.
 Jawaban Anda harus teknis, detail, dan diformat dalam Markdown.
-Sebelum memberikan jawaban utama, pastikan jawaban masih relevan dengan riwayat percakapan sebelumnya untuk menjawab pertanyaan pengguna saat ini.
+Gunakan terminologi teknis dalam Bahasa Indonesia yang konsisten jika memungkinkan, sesuai dengan konteks yang diberikan.
 Jawaban anda harus menggunakan bahasa indonesia walaupun pengguna bertanya dalam bahasa inggris.
 Jika konteks tidak berisi jawaban, sebutkan bahwa Anda tidak tahu dan jangan mengarang informasi.
 Setelah jawaban utama Anda, Anda WAJIB mengutip sumber yang Anda gunakan dari konteks. Cantumkan di bawah bagian '## 📚 Sumber', dengan mereferensikan 'source_path' dari metadata.

@@ -50,7 +50,7 @@ os.makedirs(ERROR_DIR_ROOT, exist_ok=True)
 EMBEDDING_MODELS = {
     "bge_m3":  "BAAI/bge-m3",
     "bge_code": "BAAI/bge-code-v1",
-    "codebert": "microsoft/codebert-base",
+    "codebert": "jinaai/jina-embeddings-v2-base-code",
 }
 
 DB_DIRS = {
@@ -80,12 +80,12 @@ MODEL_SETTINGS = {
         "normalize": True,
         "distance": "cosine",
     },
-    # CodeBERT: 512 token limit
+    # jinaai: 8K token limit
     "codebert": {
-        "chunk_size": 2048,
-        "overlap_lines": 5,
-        "batch_size": 16,
-        "max_length": 512,
+        "chunk_size": 4000,
+        "overlap_lines": 10,
+        "batch_size": 2,
+        "max_length": 4192,
         "pooling": "mean",
         "normalize": True,
         "distance": "cosine",
@@ -115,13 +115,15 @@ LOADER_MAPPING = {
     ".ts": TextLoader,
     ".java": TextLoader,
     ".cshtml": TextLoader,
+    ".yaml": TextLoader,
+    ".yml": TextLoader,
     ".go": TextLoader,
 }
 
 LANGUAGE_MAPPING = {
     ".cs": "c_sharp", ".py": "python", ".js": "javascript", ".ts": "typescript",
     ".java": "java", ".go": "go", ".vue": "vue", ".html": "html", ".css": "css",
-    ".md": "markdown", ".cshtml": "razor"
+    ".md": "markdown", ".cshtml": "razor","yml": "yaml"
 }
 
 

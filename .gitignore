@@ -52,6 +52,9 @@ docs/**/**/**/**/**/**/**/**/**/**/**/**/*.cs
 docs/**/**/**/**/**/**/**/**/**/**/**/**/**/*.cs
 docs/**/**/**/**/**/**/**/**/**/**/**/**/**/**/*.cs
 docs/
+docs/*.txt
+docs/*.md
+docs/*.yaml
 
 source_code_reference/
 source_code_reference/*.cs
