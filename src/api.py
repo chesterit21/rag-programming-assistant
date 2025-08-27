@@ -15,7 +15,6 @@ app = FastAPI(
 
 class QueryRequest(BaseModel):
     question: str
-    category: str | None = None
     temperature: float = 0.8
     max_tokens: int = 8192
     gpu_layers: int = 30

@@ -7,7 +7,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain.prompts import PromptTemplate
 from sentence_transformers import CrossEncoder
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
+from transformers import AutoModel, AutoTokenizer
 
 # --- Manajemen Konfigurasi Terpusat ---
 load_dotenv()
@@ -28,16 +29,22 @@ class RAGConfig:
         "bge_code": "BAAI/bge-code-v1",
         "codebert": "microsoft/codebert-base",
     }
-    EMBEDDING_DEVICE = "cpu"
+    COLLECTION_NAMES = {
+        "bge_m3": "bge_m3_collection",
+        "bge_code": "bge_code_collection",
+        "codebert": "codebert_collection",
+    }
+    EMBEDDING_DEVICE = DEVICE
 
     # Konfigurasi Reranker
     CROSS_ENCODER_MODEL = 'BAAI/bge-reranker-base'
-    CROSS_ENCODER_DEVICE = "cpu"
+    CROSS_ENCODER_DEVICE = DEVICE
 
     # Konfigurasi LLM
     OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "codegemma:7b-instruct-q4_K_M")
-    CODEGEMMA_CONTEXT_SIZE = 8192
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:0.6b-q4_K_M")
+    CODEGEMMA_CONTEXT_SIZE = 256000
+
 
     # Konfigurasi Proses Retrieval
     RETRIEVER_SEARCH_TYPE = "similarity"
@@ -110,12 +117,64 @@ JAWABAN:
 config = RAGConfig()
 print(f"Running on device: {config.DEVICE}")
 
+def mean_pooling(model_output, attention_mask):
+    """Performs mean pooling on the token embeddings."""
+    token_embeddings = model_output[0]  # (batch, seq_len, hidden)
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+    return sum_embeddings / sum_mask
+
+class ManualHuggingFaceEmbeddings:
+    """
+    A robust manual implementation for Hugging Face embeddings that mimics
+    the LangChain Embeddings interface, bypassing potential SentenceTransformer loading issues.
+    """
+    def __init__(self, tokenizer, model, normalize=True):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.normalize = normalize
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        
+        # Encode texts and move to the model's device
+        encoded_input = self.tokenizer(
+            texts, padding=True, truncation=True, return_tensors='pt'
+        ).to(self.model.device)
+        
+        # Compute token embeddings
+        with torch.no_grad():
+            model_output = self.model(**encoded_input)
+        
+        # Perform pooling
+        sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
+        
+        # Normalize embeddings
+        if self.normalize:
+            sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
+            
+        return sentence_embeddings.detach().cpu().numpy().tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_documents([text])[0]
+
+def build_manual_embedder(model_name: str, device: str):
+    """Builds a manual embedder by loading a model and tokenizer directly from Hugging Face."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    torch_dtype = torch.float16 if device == "cuda" else torch.float32
+    model = AutoModel.from_pretrained(model_name, torch_dtype=torch_dtype, trust_remote_code=True)
+    model.to(device)
+    model.eval()
+    return ManualHuggingFaceEmbeddings(tokenizer, model)
+
 class RAGSystem:
     """Mengelola semua komponen RAG dan memuat model saat dibutuhkan."""
     def __init__(self, cfg: RAGConfig):
         self.config = cfg
         self.vector_dbs: Dict[str, Chroma] = {}
-        self.embeddings: Dict[str, HuggingFaceEmbeddings] = {}
+        self.embeddings: Dict[str, ManualHuggingFaceEmbeddings] = {}
         self.cross_encoder = None
         self.llm = None
         self.tokenizer = None
@@ -133,12 +192,9 @@ class RAGSystem:
             print("Initializing embedding models...")
             for key, model_name in self.config.EMBEDDING_MODELS.items():
                 print(f" -> Loading model: {model_name} on {self.config.EMBEDDING_DEVICE}")
-                self.embeddings[key] = HuggingFaceEmbeddings(
+                self.embeddings[key] = build_manual_embedder(
                     model_name=model_name,
-                    model_kwargs={
-                        'device': self.config.EMBEDDING_DEVICE,
-                        'trust_remote_code': True
-                    }
+                    device=self.config.EMBEDDING_DEVICE
                 )
 
     def _initialize_vectordbs(self):
@@ -148,7 +204,19 @@ class RAGSystem:
             for key, db_dir in self.config.DB_DIRS.items():
                 if not os.path.exists(db_dir):
                     raise FileNotFoundError(f"Vector DB not found for '{key}' at {db_dir}. Run ingest.py.")
-                self.vector_dbs[key] = Chroma(persist_directory=db_dir, embedding_function=self.embeddings[key])
+                collection_name = self.config.COLLECTION_NAMES.get(key)
+                db = Chroma(
+                    persist_directory=db_dir,
+                    embedding_function=self.embeddings[key],
+                    collection_name=collection_name
+                )
+                self.vector_dbs[key] = db
+                # Tambahkan check jumlah dokumen untuk diagnostik
+                try:
+                    count = db._collection.count()
+                    print(f" -> Collection '{collection_name}' loaded with {count} documents.")
+                except Exception as e:
+                    print(f" -> Gagal menghitung dokumen di '{collection_name}': {e}")
 
     def _initialize_cross_encoder(self):
         if self.cross_encoder is None:
@@ -214,7 +282,8 @@ def _rrf_fuse(results: List[List[any]], k=60) -> List[any]:
     fused_scores = {}
     for docs in results:
         for rank, doc in enumerate(docs):
-            doc_id = doc.page_content
+            # Gunakan 'chunk_id' dari metadata sebagai ID unik, fallback ke konten jika tidak ada
+            doc_id = doc.metadata.get("chunk_id", doc.page_content)
             if doc_id not in fused_scores:
                 fused_scores[doc_id] = {"score": 0, "doc": doc}
             fused_scores[doc_id]["score"] += 1 / (rank + k)

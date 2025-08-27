@@ -326,15 +326,6 @@ def process_file(file_path: str, repo: Optional[git.Repo], chunk_size: int, over
         print(f"❌ Error processing {file_path}: {e}")
         return []
 
-
-def ensure_chromadb_collection(db_dir: str, collection_name: str, distance: str):
-    os.makedirs(db_dir, exist_ok=True)
-    client = chromadb.PersistentClient(path=db_dir)
-    # distance: "cosine" | "l2" | "ip"
-    col = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": distance})
-    return col
-
-
 def ingest_documents():
     # Git repo untuk metadata
     try:
@@ -386,9 +377,18 @@ def ingest_documents():
         print(f"✅ Total chunks: {len(all_chunks)}")
         chunk_ids = [f"{d.metadata['source_path']}::{i}" for i, d in enumerate(all_chunks)]
 
-        # 2) Siapkan collection ChromaDB
+        # Tambahkan chunk_id ke metadata setiap dokumen untuk identifikasi unik saat retrieval
+        for i, doc in enumerate(all_chunks):
+            doc.metadata["chunk_id"] = chunk_ids[i]
+
+        # 2) Buat client dan siapkan collection ChromaDB.
+        # Client dibuat di sini untuk memastikan koneksi tetap hidup selama proses upsert.
+        print(f"💽 Initializing ChromaDB client for {db_dir}...")
+        os.makedirs(db_dir, exist_ok=True)
+        client = chromadb.PersistentClient(path=db_dir)
         collection_name = f"{model_key}_collection"
-        collection = ensure_chromadb_collection(db_dir, collection_name, settings.get("distance", "cosine"))
+        collection = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": settings.get("distance", "cosine")})
+        print(f"  -> Collection '{collection_name}' ready. Current count: {collection.count()}")
 
         # 3) Siapkan embedder
         if DEVICE == "cuda":
@@ -427,8 +427,8 @@ def ingest_documents():
 
                 # Simpan ke ChromaDB
                 import numpy as np
-                embeddings_np = np.array(vecs, dtype=np.float32)
-                collection.add(
+                embeddings_np = np.array(vecs, dtype=np.float32).tolist()
+                collection.upsert(
                     ids=batch_ids,
                     documents=texts,
                     metadatas=metas,

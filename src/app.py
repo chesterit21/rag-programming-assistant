@@ -5,7 +5,7 @@ import os
 from typing import List
 import datetime
 
-def chat_interface(message: str, history: List[List[str]], category: str, temperature: float, max_tokens: int, gpu_layers: int):
+def chat_interface(message: str, history: List[List[str]], temperature: float, max_tokens: int, gpu_layers: int):
     """Fungsi utama untuk interaksi chatbot, mengelola state dan streaming."""
     history = history or []
     history.append([message, ""])
@@ -106,7 +106,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SFCore Assistant") as iface:
     chat_history = gr.State([])
 
     # Kumpulkan semua input untuk efisiensi
-    common_inputs = [msg_box, chat_history, category, temperature, max_tokens, gpu_layers]
+    common_inputs = [msg_box, chat_history, temperature, max_tokens, gpu_layers]
     # Tentukan output untuk fungsi chat, sekarang termasuk chat_history
     chat_outputs = [chatbot, msg_box, chat_history]
 
