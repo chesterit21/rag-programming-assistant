@@ -4,11 +4,12 @@ import tiktoken
 from dotenv import load_dotenv
 from langchain_community.llms import Ollama
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
 from langchain.prompts import PromptTemplate
 from sentence_transformers import CrossEncoder
 from typing import List, Dict, Tuple, Any
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
 # --- Manajemen Konfigurasi Terpusat ---
 load_dotenv()
@@ -22,27 +23,27 @@ class RAGConfig:
     DB_DIRS = {
         "bge_m3": os.path.join(ROOT_DIR, "chroma_db_bge_m3"),
         "bge_code": os.path.join(ROOT_DIR, "chroma_db_bge_code"),
-        "codebert": os.path.join(ROOT_DIR, "chroma_db_codebert"),
+        "gemma": os.path.join(ROOT_DIR, "chroma_db_gemma"),
     }
     EMBEDDING_MODELS = {
         "bge_m3": "BAAI/bge-m3",
         "bge_code": "BAAI/bge-code-v1",
-        "codebert": "jinaai/jina-embeddings-v2-base-code",
+        "gemma": "google/embeddinggemma-300m",
     }
     COLLECTION_NAMES = {
         "bge_m3": "bge_m3_collection",
         "bge_code": "bge_code_collection",
-        "codebert": "codebert_collection",
+        "gemma": "gemma_collection",
     }
-    EMBEDDING_DEVICE = DEVICE
+    EMBEDDING_DEVICE = "cpu" # Gunakan device yang terdeteksi secara dinamis
 
     # Konfigurasi Reranker
-    CROSS_ENCODER_MODEL = 'BAAI/bge-reranker-base'
+    CROSS_ENCODER_MODEL = 'BAAI/bge-reranker-v2-m3' # Model reranker SOTA (State-of-the-Art) yang lebih kuat
     CROSS_ENCODER_DEVICE = DEVICE
 
     # Konfigurasi LLM
     OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "codegemma:7b-instruct")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepcoder:1.5b-preview-q4_K_M")
     CODEGEMMA_CONTEXT_SIZE = 8000
 
 
@@ -51,35 +52,37 @@ class RAGConfig:
     INITIAL_K = 15 # Ambil 20 dari setiap retriever
     TOP_N_RERANKED = 15 # Ambil 20 teratas setelah reranking
 
-    # Deskripsi tugas untuk query embedding
-    TASK_DESCRIPTION = "Given a code snippet, retrieve relevant code snippets."
+    # Deskripsi tugas untuk query embedding (praktik terbaik untuk model BGE)
+    TASK_DESCRIPTIONS = {
+        "bge_m3": "Represent this sentence for searching relevant passages: ",
+        "bge_code": "Represent this code for searching relevant code snippets: ",
+        "gemma": "" # Gemma tidak memerlukan instruksi
+    }
 
     # --- Template Prompt ---
     PROMPT_QUESTION_REWRITE_ID = """
-[INST] <<SYS>>
-Anda adalah AI yang bertugas mengubah pertanyaan lanjutan menjadi pertanyaan yang berdiri sendiri.
-Berdasarkan riwayat percakapan dan pertanyaan lanjutan, tulis ulang pertanyaan lanjutan tersebut agar menjadi pertanyaan yang lengkap dan bisa dipahami tanpa konteks percakapan sebelumnya.
-<</SYS>>
+<start_of_turn>user
+Anda adalah AI yang bertugas mengubah pertanyaan lanjutan menjadi pertanyaan mandiri.
+Berdasarkan riwayat percakapan dan pertanyaan lanjutan, tulis ulang pertanyaan lanjutan tersebut menjadi pertanyaan lengkap yang dapat dipahami tanpa konteks percakapan sebelumnya.
 
 RIWAYAT PERCAKAPAN:
 {chat_history}
 
 PERTANYAAN LANJUTAN:
 {question}
-
-PERTANYAAN LENGKAP HASIL PERUBAHAN:
-[/INST]"""
+<end_of_turn>
+<start_of_turn>model
+PERTANYAAN MANDIRI:"""
 
     PROMPT_WITH_CONTEXT_ID = """
-[INST] <<SYS>>
+<start_of_turn>user
 Anda adalah asisten pemrograman ahli bernama SFCore-Assistant.
-Gunakan dokumen konteks yang diambil berikut ini DAN riwayat percakapan sebelumnya untuk menjawab pertanyaan pengguna saat ini.
+Gunakan dokumen konteks yang diambil berikut INI DAN riwayat percakapan sebelumnya untuk menjawab pertanyaan pengguna saat ini.
 Jawaban Anda harus teknis, detail, dan diformat dalam Markdown.
-Gunakan terminologi teknis dalam Bahasa Indonesia yang konsisten jika memungkinkan, sesuai dengan konteks yang diberikan.
-Jawaban anda harus menggunakan bahasa indonesia walaupun pengguna bertanya dalam bahasa inggris.
-Jika konteks tidak berisi jawaban, sebutkan bahwa Anda tidak tahu dan jangan mengarang informasi.
+Gunakan terminologi teknis yang konsisten dalam Bahasa Indonesia sedapat mungkin, sesuai dengan konteks yang diberikan.
+Jawaban Anda harus dalam Bahasa Indonesia meskipun pengguna bertanya dalam Bahasa Inggris.
+Jika konteks tidak berisi jawaban, nyatakan bahwa Anda tidak tahu dan jangan mengarang informasi.
 Setelah jawaban utama Anda, Anda WAJIB mengutip sumber yang Anda gunakan dari konteks. Cantumkan di bawah bagian '## 📚 Sumber', dengan mereferensikan 'source_path' dari metadata.
-<</SYS>>
 
 ---
 RIWAYAT PERCAKAPAN SEBELUMNYA:
@@ -92,16 +95,17 @@ KONTEKS DOKUMEN:
 PERTANYAAN SAAT INI:
 {question}
 
-JAWABAN:
-[/INST]"""
+Mari kita berpikir langkah demi langkah untuk memberikan jawaban yang terstruktur dan komprehensif.
+<end_of_turn>
+<start_of_turn>model
+"""
 
     PROMPT_NO_CONTEXT_ID = """
-[INST] <<SYS>>
+<start_of_turn>user
 Anda adalah asisten pemrograman ahli bernama SFCore-Assistant.
 Jawab pertanyaan pengguna berdasarkan pengetahuan umum Anda sebagai seorang ahli, dengan mempertimbangkan riwayat percakapan sebelumnya.
 Jawaban Anda harus teknis, detail, dan diformat dalam Markdown.
-Jawaban anda harus menggunakan bahasa indonesia walaupun pengguna bertanya dalam bahasa inggris.
-<</SYS>>
+Jawaban Anda harus dalam Bahasa Indonesia meskipun pengguna bertanya dalam Bahasa Inggris.
 
 ---
 RIWAYAT PERCAKAPAN SEBELUMNYA:
@@ -111,8 +115,10 @@ RIWAYAT PERCAKAPAN SEBELUMNYA:
 PERTANYAAN SAAT INI:
 {question}
 
-JAWABAN:
-[/INST]"""
+Mari kita berpikir langkah demi langkah untuk memberikan jawaban yang terstruktur dan komprehensif.
+<end_of_turn>
+<start_of_turn>model
+"""
 
 config = RAGConfig()
 print(f"Running on device: {config.DEVICE}")
@@ -125,12 +131,17 @@ def mean_pooling(model_output, attention_mask):
     sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
     return sum_embeddings / sum_mask
 
-class ManualHuggingFaceEmbeddings:
+def cls_pooling(model_output):
+    """Performs CLS pooling by taking the embedding of the [CLS] token."""
+    return model_output.last_hidden_state[:, 0]
+
+class ManualHuggingFaceEmbeddings(Embeddings):
     """
     A robust manual implementation for Hugging Face embeddings that mimics
     the LangChain Embeddings interface, bypassing potential SentenceTransformer loading issues.
     """
-    def __init__(self, tokenizer, model, normalize=True):
+    def __init__(self, tokenizer, model, pooling_strategy="mean", normalize=True):
+        self.pooling_strategy = pooling_strategy
         self.tokenizer = tokenizer
         self.model = model
         self.normalize = normalize
@@ -149,7 +160,10 @@ class ManualHuggingFaceEmbeddings:
             model_output = self.model(**encoded_input)
         
         # Perform pooling
-        sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
+        if self.pooling_strategy == "cls":
+            sentence_embeddings = cls_pooling(model_output)
+        else: # default to mean
+            sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
         
         # Normalize embeddings
         if self.normalize:
@@ -160,21 +174,32 @@ class ManualHuggingFaceEmbeddings:
     def embed_query(self, text: str) -> List[float]:
         return self.embed_documents([text])[0]
 
-def build_manual_embedder(model_name: str, device: str):
+def build_manual_embedder(model_name: str, device: str, pooling_strategy: str):
     """Builds a manual embedder by loading a model and tokenizer directly from Hugging Face."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    torch_dtype = torch.float16 if device == "cuda" else torch.float32
-    model = AutoModel.from_pretrained(model_name, torch_dtype=torch_dtype, trust_remote_code=True)
+    # Dapatkan token dari environment variable jika modelnya adalah Gemma (gated model)
+    token = None
+    if "gemma" in model_name.lower():
+        token = os.getenv("HUGGING_FACE_HUB_TOKEN")
+        if not token:
+            print("⚠️  Hugging Face token not found for Gemma. Trying without token. If download fails, set HUGGING_FACE_HUB_TOKEN in your .env file.")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, token=token)
+
+    # Muat model dengan presisi optimal: float16 di GPU, float32 di CPU.
+    # Ini memberikan keseimbangan terbaik antara kecepatan dan akurasi.
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    model = AutoModel.from_pretrained(model_name, dtype=dtype, trust_remote_code=True, token=token)
     model.to(device)
+
     model.eval()
-    return ManualHuggingFaceEmbeddings(tokenizer, model)
+    return ManualHuggingFaceEmbeddings(tokenizer, model, pooling_strategy=pooling_strategy)
 
 class RAGSystem:
     """Mengelola semua komponen RAG dan memuat model saat dibutuhkan."""
     def __init__(self, cfg: RAGConfig):
         self.config = cfg
         self.vector_dbs: Dict[str, Chroma] = {}
-        self.embeddings: Dict[str, ManualHuggingFaceEmbeddings] = {}
+        self.embeddings: Dict[str, Embeddings] = {}
         self.cross_encoder = None
         self.llm = None
         self.tokenizer = None
@@ -192,10 +217,28 @@ class RAGSystem:
             print("Initializing embedding models...")
             for key, model_name in self.config.EMBEDDING_MODELS.items():
                 print(f" -> Loading model: {model_name} on {self.config.EMBEDDING_DEVICE}")
-                self.embeddings[key] = build_manual_embedder(
-                    model_name=model_name,
-                    device=self.config.EMBEDDING_DEVICE
-                )
+
+                if key == "gemma":
+                    print("    - Using LangChain's HuggingFaceEmbeddings for Gemma (SentenceTransformer model).")
+                    token = os.getenv("HUGGING_FACE_HUB_TOKEN")
+                    model_kwargs = {'device': self.config.EMBEDDING_DEVICE, 'trust_remote_code': True}
+                    if token:
+                        model_kwargs['token'] = token
+
+                    self.embeddings[key] = HuggingFaceEmbeddings(
+                        model_name=model_name,
+                        model_kwargs=model_kwargs,
+                        encode_kwargs={'normalize_embeddings': True}
+                    )
+                else:
+                    # Tentukan pooling strategy untuk model BGE
+                    pooling_strategy = "cls"
+                    print(f"    - Using '{pooling_strategy}' pooling strategy for {key}.")
+                    self.embeddings[key] = build_manual_embedder(
+                        model_name=model_name,
+                        device=self.config.EMBEDDING_DEVICE,
+                        pooling_strategy=pooling_strategy
+                    )
 
     def _initialize_vectordbs(self):
         if not self.vector_dbs:
@@ -341,7 +384,10 @@ def query_rag(
     rag_system._initialize_vectordbs()
     all_retrieved_docs = []
     for key, vector_db in rag_system.vector_dbs.items():
-        query_text = rewritten_question
+        # Tambahkan instruksi khusus untuk model BGE
+        instruction = config.TASK_DESCRIPTIONS.get(key, "")
+        query_text = instruction + rewritten_question
+        print(f" -> Querying with '{key}'. Instruction: {'Yes' if instruction else 'No'}")
 
         retriever = vector_db.as_retriever(search_kwargs={"k": config.INITIAL_K})
         docs = retriever.invoke(query_text)

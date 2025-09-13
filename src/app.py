@@ -36,16 +36,21 @@ def chat_interface(message: str, history: List[List[str]], temperature: float, m
 
 def save_as_txt(chat_history: List[List[str]], category: str):
     """Menyimpan seluruh riwayat percakapan ke dalam file teks."""
-    # Debugging print statement
-    print(f"DEBUG: History received by save_as_txt: {chat_history}")
+    history_to_save = list(chat_history)
 
-    if not chat_history:
+    if not history_to_save:
         return "Tidak ada percakapan untuk disimpan."
 
-    if not chat_history[-1][1] or "*(" in chat_history[-1][1]:
-        return "Gagal menyimpan: Jawaban terakhir belum selesai."
+    # Jika jawaban terakhir belum selesai (masih streaming atau kosong),
+    # kita abaikan giliran terakhir ini dan simpan sisanya.
+    if not history_to_save[-1][1] or "*(" in history_to_save[-1][1]:
+        history_to_save.pop()
 
-    first_question = chat_history[0][0]
+    # Setelah menghapus giliran yang belum selesai, periksa lagi apakah ada yang tersisa.
+    if not history_to_save:
+        return "Tidak ada percakapan yang selesai untuk disimpan."
+
+    first_question = history_to_save[0][0]
     summary = '-'.join(first_question.lower().split()[:5])
     base_filename = re.sub(r'[^a-z0-9-]', '', summary) or "percakapan"
     
@@ -62,7 +67,7 @@ def save_as_txt(chat_history: List[List[str]], category: str):
     formatted_conversation = f"# Topik Percakapan: {first_question}\n"
     formatted_conversation += f"## Kategori: {category}\n\n"
     
-    for i, (user_msg, ai_msg) in enumerate(chat_history):
+    for i, (user_msg, ai_msg) in enumerate(history_to_save):
         formatted_conversation += f"--- Giliran Ke-{i+1} ---\n"
         formatted_conversation += f"Pengguna: {user_msg}\n\n"
         formatted_conversation += f"Asisten: {ai_msg}\n\n"

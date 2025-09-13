@@ -2,10 +2,10 @@
 # Core LangChain and RAG components
 langchain>=0.2.0,<0.3.0
 langchain-community>=0.2.0,<0.3.0
-langchain-huggingface>=0.0.3,<0.1.0
-chromadb>=0.5.0,<0.6.0
-langchain-chroma>=0.1.0,<0.2.0
-sentence-transformers>=2.6.0,<4.0.0
+langchain-huggingface>=0.0.3
+chromadb>=0.5.3
+langchain-chroma>=0.1.2
+sentence-transformers>=3.0.0
 transformers>=4.42.0,<5.0.0
 huggingface-hub>=0.23.0,<1.0.0
 bitsandbytes>=0.43.0,<0.44.0
