@@ -87,11 +87,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SFCore Assistant") as iface:
                 msg_box = gr.Textbox(
                     label="Pesan", 
                     placeholder="Ketik pertanyaan Anda di sini...",
-                    lines=4,
-                    scale=8,
+                    lines=3,
+                    scale=7,
                     show_label=False,
                 )
-                submit_btn = gr.Button("Kirim", variant="primary", scale=1, min_width=150)
+                submit_btn = gr.Button("Kirim", variant="primary", scale=1, min_width=120)
+                stop_btn = gr.Button("Berhenti", variant="stop", scale=1, min_width=120)
             gr.Markdown("<small>Tekan Ctrl+Enter untuk mengirim pesan.</small>")
 
         with gr.Column(scale=1):
@@ -116,15 +117,22 @@ with gr.Blocks(theme=gr.themes.Soft(), title="SFCore Assistant") as iface:
     chat_outputs = [chatbot, msg_box, chat_history]
 
     # Hubungkan event ke fungsi
-    submit_btn.click(
+    # Event untuk mengirim pesan, dibuat bisa dibatalkan (cancellable)
+    submit_event = submit_btn.click(
         fn=chat_interface,
         inputs=common_inputs,
         outputs=chat_outputs
     )
-    msg_box.submit(
+    msg_event = msg_box.submit(
         fn=chat_interface,
         inputs=common_inputs,
         outputs=chat_outputs
+    )
+
+    # Event untuk tombol berhenti, yang akan membatalkan event pengiriman
+    stop_btn.click(
+        fn=None,
+        cancels=[submit_event, msg_event]
     )
     
     save_btn.click(
