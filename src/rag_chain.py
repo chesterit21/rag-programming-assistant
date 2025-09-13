@@ -43,7 +43,7 @@ class RAGConfig:
 
     # Konfigurasi LLM
     OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepcoder:1.5b-preview-q4_K_M")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepcoder:1.5b-preview-fp16")
     CODEGEMMA_CONTEXT_SIZE = 8000
 
 
@@ -275,7 +275,7 @@ class RAGSystem:
                 temperature=temperature,
                 num_ctx=max_tokens,
                 num_gpu=effective_gpu_layers,
-                stop=["<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>", "<|reserved_special_token>"]
+                stop=["\n### Instruction:", "\n### Question:", "\n### Response:", "###"]
             )
         
         if self.prompt_with_context is None:
