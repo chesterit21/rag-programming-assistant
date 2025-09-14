@@ -148,3 +148,6 @@ chroma_db_bge_code/5987972a-07ba-44db-a71a-141862db1f27/index_metadata.pickle
 chroma_db_sfr_code/9907db70-4897-4264-9dd0-e8f1e9a52414/index_metadata.pickle
 .gitignore
 prompt_build.txt
+chroma_db_bge_code/3372654e-8d79-44e8-a449-c9e123b50db2/index_metadata.pickle
+chroma_db_bge_m3/de6e6d7d-f8ee-4a3d-803e-f2a88a617084/index_metadata.pickle
+chroma_db_gemma/d72185d1-067a-4904-a8e9-7e80cc41582f/index_metadata.pickle

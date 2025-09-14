@@ -1,516 +1,291 @@
 # ingests.py
-
 import os
-# Atasi peringatan deadlock dari tokenizer saat menggunakan ProcessPoolExecutor
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import glob
-import torch
-import json
-import git
-import functools
-import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import glob, torch, json, git, functools, shutil, re, time
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Iterator, Optional
 
-# Tree-sitter (opsional, dengan fallback)
+# Tree-sitter (optional)
 TS_AVAILABLE = True
 try:
     from tree_sitter import Language, Parser
     from tree_sitter_languages import get_language as get_tree_sitter_language
 except Exception:
     TS_AVAILABLE = False
-    print("⚠️ Tree-sitter not available. Falling back to basic chunking for code.")
-    Language = None
-    Parser = None
-    get_tree_sitter_language = None
 
-# LangChain & loaders
+# LangChain, ChromaDB, Transformers
 from langchain.docstore.document import Document
 from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader, TextLoader, JSONLoader, UnstructuredHTMLLoader,
-    UnstructuredWordDocumentLoader, UnstructuredExcelLoader, WebBaseLoader
-)
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, JSONLoader, UnstructuredHTMLLoader, UnstructuredWordDocumentLoader, UnstructuredExcelLoader
 from dotenv import load_dotenv
-
-# ChromaDB (pakai client langsung agar bisa add embeddings precomputed)
 import chromadb
 from chromadb import PersistentClient, Settings
+from transformers import AutoModel, AutoTokenizer
 
-# HF Transformers untuk manual embedder
-from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
-
-# --- Konfigurasi & Deteksi Perangkat --- #
+# --- Config ---
 load_dotenv()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Running on device: {DEVICE}")
-
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS_DIR = os.path.join(ROOT_DIR, "docs")
 ERROR_DIR_ROOT = os.path.join(ROOT_DIR, "file_error_ingest")
 os.makedirs(ERROR_DIR_ROOT, exist_ok=True)
 
-# --- Konfigurasi Embedding --- #
 EMBEDDING_MODELS = {
-    "bge_m3":  "BAAI/bge-m3",
+    "bge_m3": "BAAI/bge-m3",
     "bge_code": "BAAI/bge-code-v1",
     "gemma": "google/embeddinggemma-300m",
 }
-
-DB_DIRS = {
-    "bge_m3":  os.path.join(ROOT_DIR, "chroma_db_bge_m3"),
-    "bge_code": os.path.join(ROOT_DIR, "chroma_db_bge_code"),
-    "gemma": os.path.join(ROOT_DIR, "chroma_db_gemma"),
-}
-
+DB_DIRS = {k: os.path.join(ROOT_DIR, f"chroma_db_{k}") for k in EMBEDDING_MODELS}
 MODEL_SETTINGS = {
-    # BGE-M3: Multi-lingual multi-function (text/code), context panjang
-    "bge_m3": {
-        "chunk_size": 4096,
-        "overlap_lines": 10,
-        "batch_size": 8,
-        "max_length": 8192,
-        "pooling": "cls", # Praktik terbaik untuk BGE adalah 'cls' pooling
-        "normalize": True,
-        "distance": "cosine",
-    },
-    # BGE-CODE: fokus code, context 4k
-    "bge_code": {
-        "chunk_size": 512, # Sesuaikan dengan max_length
-        "overlap_lines": 10,
-        "batch_size": 8,
-        "max_length": 512, # bge-code-v1 memiliki konteks 512 token
-        "pooling": "cls", # Praktik terbaik untuk BGE adalah 'cls' pooling
-        "normalize": True,
-        "distance": "cosine",
-    },
-    "gemma": {
-        "chunk_size": 2048,
-        "overlap_lines": 10,
-        "batch_size": 16, # Model 300M ringan, bisa pakai batch size besar
-        "max_length": 8192, # Konteks tetap 8k
-        "pooling": "mean",
-        "normalize": True,
-        "distance": "cosine",
-    },
+    "bge_m3": {"chunk_size": 4096, "overlap_lines": 10, "batch_size": 8, "max_length": 8192, "pooling": "cls", "normalize": True, "distance": "cosine"},
+    "bge_code": {"chunk_size": 512, "overlap_lines": 10, "batch_size": 8, "max_length": 512, "pooling": "cls", "normalize": True, "distance": "cosine"},
+    "gemma": {"chunk_size": 2048, "overlap_lines": 10, "batch_size": 16, "max_length": 8192, "pooling": "mean", "normalize": True, "distance": "cosine"},
 }
+EMBEDDER_CACHE = {}
 
-# --- Pemecah Teks (Text Splitters) --- #
-MARKDOWN_SPLITTER = MarkdownHeaderTextSplitter(
-    headers_to_split_on=[("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")],
-    strip_headers=False, return_each_line=False
-)
-
-GENERIC_TEXT_SPLITTER = RecursiveCharacterTextSplitter(
-    # Ukuran chunk yang lebih kecil untuk dokumen umum agar lebih fokus.
-    chunk_size=2000, 
-    chunk_overlap=200
-)
-
-# --- Loader mapping --- #
+# --- Splitters & Loaders ---
+MARKDOWN_SPLITTER = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "H1"), ("##", "H2"), ("###", "H3")])
+GENERIC_TEXT_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
 LOADER_MAPPING = {
-    ".pdf": PyPDFLoader,
-    ".json": lambda p: JSONLoader(p, jq_schema=".", text_content=False),
-    ".html": UnstructuredHTMLLoader,
-    ".docx": UnstructuredWordDocumentLoader,
-    ".xlsx": UnstructuredExcelLoader,
-    ".xls": UnstructuredExcelLoader,
-    ".md": TextLoader,
-    ".txt": TextLoader,
-    ".cs": TextLoader,
-    ".vue": TextLoader,
-    ".py": TextLoader,
-    ".js": TextLoader,
-    ".ts": TextLoader,
-    ".java": TextLoader,
-    ".cshtml": TextLoader,
-    ".yaml": TextLoader,
-    ".yml": TextLoader,
-    ".go": TextLoader,
+    ".pdf": PyPDFLoader, ".json": lambda p: JSONLoader(p, jq_schema=".", text_content=False),
+    ".html": UnstructuredHTMLLoader, ".docx": UnstructuredWordDocumentLoader, ".xlsx": UnstructuredExcelLoader,
+    ".md": TextLoader, ".txt": TextLoader, ".cs": TextLoader, ".vue": TextLoader, ".py": TextLoader,
+    ".js": TextLoader, ".ts": TextLoader, ".java": TextLoader, ".cshtml": TextLoader, ".yaml": TextLoader, ".yml": TextLoader, ".go": TextLoader,
 }
-
-LANGUAGE_MAPPING = {
-    ".cs": "c_sharp", ".py": "python", ".js": "javascript", ".ts": "typescript",
-    ".java": "java", ".go": "go", ".vue": "vue", ".html": "html", ".css": "css",
-    ".md": "markdown", ".cshtml": "razor","yml": "yaml"
-}
-
+LANGUAGE_MAPPING = {ext: lang for ext, lang in {
+    ".cs": "c_sharp", ".py": "python", ".js": "javascript", ".ts": "typescript", ".java": "java", ".go": "go",
+    ".vue": "vue", ".html": "html", ".css": "css", ".md": "markdown", ".cshtml": "razor", ".yml": "yaml"
+}.items()}
 
 # ---------- Utilities ---------- #
+def clean_content(text: str, language: Optional[str] = None) -> str:
+    """
+    Cleans text content by normalizing whitespace, handling encoding,
+    and optionally removing comments and lowercasing based on language.
+    """
+    # 1. Handle encoding issues and remove non-ASCII characters
+    text = text.encode("utf-8", "ignore").decode("utf-8")
+    text = re.sub(r'[^\x00-\x7F]+', '', text)
+
+    # 2. Remove comments if it's a known code language
+    if language and language not in ["markdown", "text", "yaml", "yml"]:
+        # Regex for C-style (//, /*...*/), Python/Ruby (#)
+        text = re.sub(r'//.*?$|/\*.*?\*/|#.*?$', '', text, flags=re.MULTILINE | re.DOTALL)
+
+    # 3. Normalize whitespace. For Markdown, preserve newlines needed for splitting.
+    if language != "markdown":
+        text = re.sub(r'[ \t\r\f\v]+', ' ', text) # Replace various whitespace with a single space
+        text = re.sub(r'\n{3,}', '\n\n', text) # Collapse more than 2 newlines
+    else:
+        text = re.sub(r' +', ' ', text) # Only collapse multiple spaces on the same line
+
+    # 4. Lowercase for non-code or case-insensitive languages
+    if not language or language in ["text", "markdown"]:
+         text = text.lower()
+
+    return text.strip()
+
+def ast_chunker(content: str, language_name: str, max_chunk_size: int, overlap_lines: int) -> Iterator[str]:
+    """
+    Splits code into chunks based on its AST using tree-sitter.
+    Falls back to RecursiveCharacterTextSplitter if tree-sitter fails.
+    """
+    try:
+        ts_lang = get_tree_sitter_language(language_name)
+        parser = Parser()
+        parser.set_language(ts_lang)
+        tree = parser.parse(bytes(content, "utf8"))
+        
+        # Node types that are good candidates for top-level chunks
+        # This can be customized per language for better results
+        split_nodes = ['function_definition', 'class_definition', 'method_definition']
+
+        chunks = []
+        current_chunk = ""
+        
+        def traverse(node):
+            nonlocal current_chunk
+            if node.type in split_nodes:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = node.text.decode('utf-8')
+            else:
+                for child in node.children:
+                    traverse(child)
+
+        traverse(tree.root_node)
+        if current_chunk: chunks.append(current_chunk)
+        
+        return iter(chunks if chunks else [content])
+    except Exception:
+        return iter(RecursiveCharacterTextSplitter(chunk_size=max_chunk_size, chunk_overlap=overlap_lines).split_text(content))
 
 def mean_pooling(model_output, attention_mask):
-    token_embeddings = model_output[0]  # (batch, seq_len, hidden)
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-    return sum_embeddings / sum_mask
+    tok_emb = model_output[0]
+    mask = attention_mask.unsqueeze(-1).expand(tok_emb.size()).float()
+    return torch.sum(tok_emb * mask, 1) / torch.clamp(mask.sum(1), min=1e-9)
 
 def cls_pooling(model_output):
-    """Performs CLS pooling by taking the embedding of the [CLS] token."""
-    # [:, 0] mengambil embedding dari token pertama (CLS) untuk setiap item di batch
     return model_output.last_hidden_state[:, 0]
 
-
-def build_manual_embedder(model_name: str, max_length: int, pooling_strategy: str, normalize: bool = True):
-    """
-    Manual embedder (GPU jika ada) untuk model HF apa pun yang output last_hidden_state (BERT/BGE).
-    """
-    # Dapatkan token dari environment variable jika modelnya adalah Gemma (gated model)
-    token = None
-    if "gemma" in model_name.lower():
-        token = os.getenv("HUGGING_FACE_HUB_TOKEN")
-        if not token:
-            print("⚠️  Hugging Face token not found for Gemma. Trying without token. If download fails, set HUGGING_FACE_HUB_TOKEN in your .env file.")
-
-    # Model dan tokenizer diunduh sekali dan disimpan di cache Hugging Face.
-    # Eksekusi selanjutnya akan memuat dari cache lokal, memungkinkan operasi offline.
+def build_manual_embedder(model_name: str, max_length: int, pooling: str, normalize: bool = True):
+    if model_name in EMBEDDER_CACHE: return EMBEDDER_CACHE[model_name]
+    token = os.getenv("HUGGING_FACE_HUB_TOKEN") if "gemma" in model_name.lower() else None
     tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, token=token)
-
-    # Muat model dengan presisi optimal: float16 di GPU, float32 di CPU.
-    # Ini memberikan keseimbangan terbaik antara kecepatan dan akurasi.
     dtype = torch.float16 if DEVICE == "cuda" else torch.float32
-    mdl = AutoModel.from_pretrained(model_name, dtype=dtype, trust_remote_code=True, token=token)
-    # Memindahkan model ke perangkat yang terdeteksi (GPU/CPU) untuk eksekusi lokal.
-    mdl.to(DEVICE)
-
-    mdl.eval()
+    mdl = AutoModel.from_pretrained(model_name, dtype=dtype, trust_remote_code=True, token=token).to(DEVICE).eval()
 
     class ManualEmbedder:
-        def __init__(self, tokenizer, model, max_len, do_norm):
-            # Simpan strategi pooling untuk digunakan dalam embed_documents
-            self.pooling_strategy = pooling_strategy
-            self.tok = tokenizer
-            self.model = model
-            self.max_len = max_len
-            self.do_norm = do_norm
+        def __init__(self, tokenizer, model, max_len, do_norm, pool_strat):
+            self.tok, self.model, self.max_len, self.do_norm, self.pool = tokenizer, model, max_len, do_norm, pool_strat
 
         def embed_documents(self, texts: List[str]) -> List[List[float]]:
-            if not texts:
-                return []
-            enc = self.tok(
-                texts, padding=True, truncation=True,
-                max_length=self.max_len, return_tensors='pt'
-            ).to(DEVICE)
-            with torch.no_grad():
-                out = self.model(**enc)
-            
-            # Panggil fungsi pooling yang sesuai berdasarkan strategi
-            sent = cls_pooling(out) if self.pooling_strategy == "cls" else mean_pooling(out, enc['attention_mask'])
+            if not texts: return []
+            enc = self.tok(texts, padding=True, truncation=True, max_length=self.max_len, return_tensors='pt').to(DEVICE)
+            with torch.no_grad(): out = self.model(**enc)
+            sent = cls_pooling(out) if self.pool == "cls" else mean_pooling(out, enc['attention_mask'])
+            if self.do_norm: sent = torch.nn.functional.normalize(sent, p=2, dim=1)
+            return sent.cpu().numpy().tolist()
 
-            if self.do_norm:
-                sent = torch.nn.functional.normalize(sent, p=2, dim=1)
-            return sent.detach().cpu().numpy().tolist()
-
-        def embed_query(self, text: str) -> List[float]:
-            return self.embed_documents([text])[0]
-
-    return ManualEmbedder(tok, mdl, max_length, normalize)
-
+    embedder = ManualEmbedder(tok, mdl, max_length, normalize, pooling)
+    EMBEDDER_CACHE[model_name] = embedder
+    return embedder
 
 def get_git_metadata(repo: Optional[git.Repo], file_path: str) -> Dict[str, Any]:
     try:
-        if repo and repo.remotes:
-            origin_url = repo.remotes.origin.url if 'origin' in [r.name for r in repo.remotes] else ""
-        else:
-            origin_url = ""
+        origin_url = repo.remotes.origin.url if repo and repo.remotes else ""
         repo_name = origin_url.split('/')[-1].replace('.git', '') if origin_url else "local"
-        last_commit = next(repo.iter_commits(paths=file_path, max_count=1)) if repo else None
-        return {
-            "repo_name": repo_name,
-            "last_commit_date": (last_commit.committed_datetime.isoformat() if last_commit else ""),
-            "last_commit_author": (last_commit.author.name if last_commit else ""),
-        }
-    except Exception:
-        return {"repo_name": "local", "last_commit_date": "", "last_commit_author": ""}
+        commit = next(repo.iter_commits(paths=file_path, max_count=1)) if repo else None
+        return {"repo_name": repo_name, "last_commit_date": commit.committed_datetime.isoformat() if commit else "", "last_commit_author": commit.author.name if commit else ""}
+    except Exception: return {"repo_name": "local", "last_commit_date": "", "last_commit_author": ""}
 
+def analyze_chunks(chunks: List[Document], model_key: str):
+    if not chunks: return
+    char_lengths = [len(c.page_content) for c in chunks]
+    print(f"  🔍 Chunk Analysis for '{model_key}':")
+    print(f"     - Count: {len(chunks)}")
+    print(f"     - Avg Length: {sum(char_lengths) / len(char_lengths):.2f} chars")
+    print(f"     - Min/Max Length: {min(char_lengths)} / {max(char_lengths)} chars")
 
-def ast_chunker(
-    code: str,
-    language_name: Optional[str],
-    max_chunk_size: int = 4096,
-    overlap_lines: int = 10
-) -> Iterator[Document]:
-    """
-    AST-based chunker menggunakan tree-sitter bila tersedia, fallback ke line-based bila tidak.
-    """
-    if not TS_AVAILABLE or language_name is None:
-        # fallback: line-based chunking kasar
-        lines = code.splitlines()
-        chunks = []
-        current = []
-        current_len = 0
-        for ln in lines:
-            add = len(ln) + 1
-            if current_len + add > max_chunk_size and current:
-                chunks.append("\n".join(current))
-                current = [ln]
-                current_len = add
-            else:
-                current.append(ln)
-                current_len += add
-        if current:
-            chunks.append("\n".join(current))
-        # overlap
-        docs = []
-        for i, chunk in enumerate(chunks):
-            if i > 0:
-                prev_lines = chunks[i-1].splitlines()
-                overlap = "\n".join(prev_lines[-overlap_lines:])
-                chunk = overlap + "\n" + chunk
-            docs.append(Document(page_content=chunk, metadata={"start_line": 0}))
-        return iter(docs)
-
-    # Tree-sitter path
+def process_file(file_path: str, repo: Optional[git.Repo], chunk_size: int, overlap_lines: int, model_key: str) -> List[Document]:
     try:
-        if get_tree_sitter_language is None:
-            # Fallback if tree-sitter is not available
-            return ast_chunker(code, None, max_chunk_size, overlap_lines)
-        ts_lang = get_tree_sitter_language(language_name)
-    except Exception:
-        # Jika grammar tidak ada, fallback
-        return ast_chunker(code, None, max_chunk_size, overlap_lines)
-
-    if Parser is None:
-        # Fallback to line-based chunking if Parser is not available
-        return ast_chunker(code, None, max_chunk_size, overlap_lines)
-    parser = Parser()
-    parser.set_language(ts_lang)
-    tree = parser.parse(bytes(code, "utf8"))
-
-    chunks: List[str] = []
-    current_chunk_code = ""
-
-    for node in tree.root_node.children:
-        try:
-            node_code = node.text.decode("utf8")
-        except Exception:
-            continue
-        if len(current_chunk_code) + len(node_code) > max_chunk_size:
-            if current_chunk_code:
-                chunks.append(current_chunk_code)
-            current_chunk_code = node_code
-        else:
-            current_chunk_code += ("\n" if current_chunk_code else "") + node_code
-
-    if current_chunk_code:
-        chunks.append(current_chunk_code)
-
-    docs: List[Document] = []
-    for i, chunk_text in enumerate(chunks):
-        if i > 0:
-            prev_chunk_lines = chunks[i-1].splitlines()
-            overlap = "\n".join(prev_chunk_lines[-overlap_lines:])
-            chunk_text = overlap + "\n" + chunk_text
-        docs.append(Document(page_content=chunk_text, metadata={"start_line": 0}))
-    return iter(docs)
-
-
-def process_file(file_path: str, repo: Optional[git.Repo], chunk_size: int, overlap_lines: int) -> List[Document]:
-    try:
-        print(f"Processing file: {file_path}")
         ext = os.path.splitext(file_path)[1].lower()
-        language_name = LANGUAGE_MAPPING.get(ext)
+        lang = LANGUAGE_MAPPING.get(ext)
+
+        loader = LOADER_MAPPING.get(ext, TextLoader)(file_path)
+        docs = loader.load()
+        if not docs: return []
         
-        # 1. Muat konten mentah dari file
-        LoaderCls = LOADER_MAPPING.get(ext)
-        if not LoaderCls:
-            print(f"⚠️ No loader found for extension {ext}, skipping file {file_path}")
-            return []
+        content = clean_content(
+            "\n\n".join(d.page_content for d in docs if d.page_content),
+            language=lang
+        )
         
-        loader = LoaderCls(file_path)
-        loaded_docs = loader.load()
-        if not loaded_docs:
-            return []
-        
-        # Gabungkan konten jika loader menghasilkan beberapa dokumen (misalnya, per halaman PDF)
-        content = "\n\n".join([doc.page_content for doc in loaded_docs if doc.page_content])
-        
-        # 2. Pilih strategi chunking yang tepat
         chunks = []
-        # Penanganan khusus untuk file kamus dalam format .txt
         if ext == ".txt" and ("kamus" in file_path or "dictionary" in file_path):
-            print(f"  -> Treating {os.path.basename(file_path)} as a dictionary file.")
-            # Setiap baris yang tidak kosong dianggap sebagai satu dokumen/definisi utuh.
-            lines = content.strip().split('\n')
-            chunks = [Document(page_content=line) for line in lines if line.strip()]
-        elif language_name and language_name not in ["markdown", "razor", "html", "css", "yaml"]:
-            # Gunakan AST chunker untuk kode
-            chunk_iterator = ast_chunker(content, language_name, max_chunk_size=chunk_size, overlap_lines=overlap_lines)
-            chunks = list(chunk_iterator)
-        elif language_name == "markdown":
-            # Gunakan Markdown splitter
-            # Markdown splitter menghasilkan Document, jadi tidak perlu konversi
-            split_docs = MARKDOWN_SPLITTER.split_text(content)
-            # Pastikan hanya objek Document yang valid yang diproses
-            chunks = [doc for doc in split_docs if hasattr(doc, 'page_content')]
+            chunks = [Document(page_content=line) for line in content.strip().split('\n') if line.strip()]
+        elif TS_AVAILABLE and lang and lang not in ["markdown", "html", "css"]:
+            # Use AST chunker for code files
+            chunks = list(ast_chunker(content, lang, max_chunk_size=chunk_size, overlap_lines=overlap_lines))
+        elif lang == "markdown":
+            chunks = MARKDOWN_SPLITTER.split_text(content)
         else:
-            # Fallback ke splitter umum untuk PDF, DOCX, TXT, dll.
-            # Kita gunakan splitter ini pada konten yang sudah digabung.
-            chunks = GENERIC_TEXT_SPLITTER.split_documents(loaded_docs)
+            chunks = GENERIC_TEXT_SPLITTER.split_documents([Document(page_content=content)])
 
-        # 3. Tambahkan metadata ke setiap chunk
         rel_path = os.path.relpath(file_path, ROOT_DIR)
-        git_meta = get_git_metadata(repo, file_path) if repo else {}
-
-        out_docs: List[Document] = []
+        git_meta = get_git_metadata(repo, file_path)
+        base_meta = {"source_path": rel_path, "language": lang or "text", "model_used": model_key, "embedding_date": datetime.now().isoformat(), "file_type": ext.strip('.'), "tags": "", "relevance_score": 1.0, "feedback": ""} 
+        
+        out_docs = []
         for ch in chunks:
-            if not ch or not getattr(ch, "page_content", None):
-                continue
-            md = ch.metadata if hasattr(ch, "metadata") else {}
-            md.update({
-                "source_path": rel_path,
-                "language": language_name or "text",
-                **git_meta
-            })
+            if not ch or not getattr(ch, "page_content", None): continue
+            md = {**base_meta, **git_meta, **(ch.metadata if hasattr(ch, "metadata") else {})}
             out_docs.append(Document(page_content=ch.page_content, metadata=md))
 
-        print(f"✅ Processed and chunked: {rel_path} -> {len(out_docs)} chunks")
-        return out_docs
+        # Jika setelah semua proses, tidak ada dokumen yang dihasilkan, anggap sebagai kegagalan sunyi
+        if not out_docs:
+            print(f"⚠️  Warning: No content/chunks generated from file {file_path}. Skipping.")
+            return []
 
-    except Exception as e:
+        return out_docs
+    except Exception as e: 
         print(f"❌ Error processing {file_path}: {e}")
+        try:
+            # Buat direktori error spesifik untuk model yang sedang berjalan
+            error_dir_for_model = os.path.join(ERROR_DIR_ROOT, model_key)
+            os.makedirs(error_dir_for_model, exist_ok=True)
+            
+            # Salin file yang bermasalah untuk inspeksi lebih lanjut
+            shutil.copy(file_path, error_dir_for_model)
+            print(f"  ↪️  File yang gagal telah disalin ke: {error_dir_for_model}")
+        except Exception as copy_e:
+            print(f"  ⚠️ Gagal menyalin file bermasalah {file_path}: {copy_e}")
         return []
 
 def ingest_documents():
-    # Git repo untuk metadata
-    try:
-        repo = git.Repo(ROOT_DIR, search_parent_directories=True)
-    except git.InvalidGitRepositoryError:
-        print("⚠️ Not a git repository. Git metadata will not be available.")
-        repo = None
+    try: repo = git.Repo(ROOT_DIR, search_parent_directories=True)
+    except git.InvalidGitRepositoryError: repo = None
 
-    # Kumpulkan file
     all_files = [p for p in glob.glob(os.path.join(DOCS_DIR, "**", "*"), recursive=True) if os.path.isfile(p)]
-    if not all_files:
-        print(f"⚠️ Tidak ada file di {DOCS_DIR}.")
-        return
+    if not all_files: return print(f"⚠️ No files in {DOCS_DIR}.")
+
+    # Statistik yang lebih jelas
+    stats = {"successful_ops": 0, "failed_ops": 0, "total_chunks": 0}
+    start_time = time.time()
 
     for model_key, model_name in EMBEDDING_MODELS.items():
+        model_start_time = time.time()
         settings = MODEL_SETTINGS[model_key]
-        db_dir = DB_DIRS[model_key]
-        error_dir = os.path.join(ERROR_DIR_ROOT, model_key)
-        os.makedirs(error_dir, exist_ok=True)
-
-        print(f"\n=== Embedding model: {model_name} ({model_key}) ===")
-        print(f"Settings: {settings}")
-
-        # 1) Chunking paralel
-        print(f"🚀 Chunking parallel untuk {model_key}...")
-        all_chunks: List[Document] = []
-        process_file_args = {
-            "chunk_size": settings["chunk_size"],
-            "overlap_lines": settings["overlap_lines"]
-        }
-        process_func = functools.partial(process_file, repo=repo, **process_file_args)
-
-        # NOTE: Tree-sitter bisa bermasalah di multiprocessing di beberapa OS;
-        # jika error, ubah ke ThreadPoolExecutor atau proses serial.
-        with ProcessPoolExecutor() as executor:
+        print(f"\n=== Embedding with '{model_name}' ({model_key}) ===")
+        
+        process_func = functools.partial(process_file, repo=repo, **{k: settings[k] for k in ["chunk_size", "overlap_lines"]}, model_key=model_key)
+        model_files_processed = 0
+        
+        all_chunks = []
+        with (ThreadPoolExecutor if os.name == 'nt' else ProcessPoolExecutor)() as executor:
             futures = {executor.submit(process_func, fp): fp for fp in all_files}
             for fut in as_completed(futures):
-                try:
-                    res = fut.result()
-                    if res:
-                        all_chunks.extend(res)
-                except Exception as e:
-                    print(f"❌ Worker gagal utk {futures[fut]}: {e}")
+                res = fut.result()
+                if res:
+                    stats["successful_ops"] += 1
+                    all_chunks.extend(res)
+                    model_files_processed += 1
+                else:
+                    stats["failed_ops"] += 1
+        if not all_chunks: continue
+        stats["total_chunks"] += len(all_chunks)
+        analyze_chunks(all_chunks, model_key)
 
-        if not all_chunks:
-            print(f"⚠️ Tidak ada chunk untuk {model_key}. Skip.")
-            continue
-
-        print(f"✅ Total chunks: {len(all_chunks)}")
-        chunk_ids = [f"{d.metadata['source_path']}::{i}" for i, d in enumerate(all_chunks)]
-
-        # Tambahkan chunk_id ke metadata setiap dokumen untuk identifikasi unik saat retrieval
         for i, doc in enumerate(all_chunks):
-            doc.metadata["chunk_id"] = chunk_ids[i]
+            doc.metadata["chunk_id"] = f"{doc.metadata['source_path']}::{i}"
 
-        # 2) Buat client dan siapkan collection ChromaDB.
-        # Client dibuat di sini untuk memastikan koneksi tetap hidup selama proses upsert.
-        print(f"💽 Initializing ChromaDB client for {db_dir}...")
-        os.makedirs(db_dir, exist_ok=True)
-        # Menambahkan setting untuk menonaktifkan anonimisasi telemetri
-        chroma_settings = Settings(anonymized_telemetry=False)
-        client = chromadb.PersistentClient(path=db_dir, settings=chroma_settings)
+        client = chromadb.PersistentClient(path=DB_DIRS[model_key], settings=Settings(anonymized_telemetry=False))
+        collection = client.get_or_create_collection(name=f"{model_key}_collection", metadata={"hnsw:space": settings["distance"]})
+        embedder = build_manual_embedder(model_name, **{k: settings[k] for k in ["max_length", "pooling", "normalize"]})
 
-        collection_name = f"{model_key}_collection"
-        collection = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": settings.get("distance", "cosine")})
-        print(f"  -> Collection '{collection_name}' ready. Current count: {collection.count()}")
-
-        # 3) Siapkan embedder, pilih metode yang tepat untuk setiap model
-        if model_key == "gemma":
-            print("  -> Using LangChain's HuggingFaceEmbeddings for Gemma (SentenceTransformer model).")
-            print("     (Proses unduh model mungkin memakan waktu beberapa menit saat pertama kali dijalankan...)")
-            # Gunakan token untuk gated model
-            token = os.getenv("HUGGING_FACE_HUB_TOKEN")
-            model_kwargs = {'device': DEVICE, 'trust_remote_code': True}
-            if token:
-                model_kwargs['token'] = token
-            
-            embedder = HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs=model_kwargs,
-                encode_kwargs={'normalize_embeddings': settings.get("normalize", True), 'batch_size': settings["batch_size"]}
-            )
-        elif DEVICE == "cuda":
-            # Manual embedder untuk model BGE yang lebih fleksibel
-            print("     (Proses unduh model mungkin memakan waktu beberapa menit saat pertama kali dijalankan...)")
-            embedder = build_manual_embedder(
-                model_name=model_name,
-                max_length=settings["max_length"],
-                pooling_strategy=settings["pooling"],
-                normalize=settings.get("normalize", True),
-            )
-
-        # 4) Upsert batched
-        total = len(all_chunks)
-        bs = settings["batch_size"]
+        total, bs = len(all_chunks), settings["batch_size"]
         for start in range(0, total, bs):
             end = min(start + bs, total)
-            batch_docs = all_chunks[start:end]
-            batch_ids = chunk_ids[start:end]
-            texts = [d.page_content for d in batch_docs]
-            metas = [d.metadata for d in batch_docs]
-
-            print(f"  -> Upserting batch {start//bs + 1}/{(total + bs - 1)//bs} (size={len(texts)})")
+            batch = all_chunks[start:end]
+            texts = [d.page_content for d in batch]
+            
             try:
-                # Compute embeddings
-                if hasattr(embedder, "embed_documents"):
-                    vecs = embedder.embed_documents(texts)
-                else:
-                    # LangChain embedder fallback (should have embed_documents)
-                    vecs = embedder.embed_documents(texts)  # type: ignore
-
-                # Simpan ke ChromaDB
-                import numpy as np
-                embeddings_np = np.array(vecs, dtype=np.float32).tolist()
-                collection.upsert(
-                    ids=batch_ids,
-                    documents=texts,
-                    metadatas=metas,
-                    embeddings=embeddings_np
-                )
+                vecs = embedder.embed_documents(texts)
+                if len(vecs) != len(batch):
+                    print(f"  ⚠️ Mismatch embeddings for batch {start//bs+1}: got {len(vecs)} vectors for {len(batch)} documents. Skipping batch.")
+                    continue
+                collection.upsert(ids=[d.metadata["chunk_id"] for d in batch], documents=texts, metadatas=[d.metadata for d in batch], embeddings=vecs)
             except Exception as e:
-                print(f"  ❌ Gagal upsert batch {start//bs + 1}: {e}")
-                print("  -> Menyalin file bermasalah untuk inspeksi...")
-                for d in batch_docs:
-                    src_rel = d.metadata.get("source_path")
-                    if src_rel:
-                        src_abs = os.path.join(ROOT_DIR, src_rel)
-                        dst = os.path.join(error_dir, os.path.basename(src_rel))
-                        try:
-                            if os.path.exists(src_abs):
-                                shutil.copy2(src_abs, dst)
-                                print(f"    -> Copied {src_rel} -> {dst}")
-                        except Exception as ce:
-                            print(f"    -> Gagal copy {src_rel}: {ce}")
+                failed_files = {d.metadata.get('source_path', 'unknown') for d in batch}
+                print(f"  ❌ Upsert failed for batch {start//bs+1}: {e}. Files in batch: {', '.join(failed_files)}")
+        
+        model_time = time.time() - model_start_time
+        print(f"📊 Model '{model_key}': Ingested {len(all_chunks)} chunks from {model_files_processed} files in {model_time:.2f}s.")
 
-        print(f"✅ Ingestion selesai untuk model '{model_key}' ({model_name}).")
-
-    print("\n🎉 Semua ingestion selesai. Vector stores siap dipakai.")
-
+    total_time = time.time() - start_time
+    print(f"\n🎉 Ingestion complete in {total_time:.2f}s. Total Stats: {stats['successful_ops']} successful operations, {stats['failed_ops']} failed operations, {stats['total_chunks']} total chunks generated.")
 
 if __name__ == "__main__":
+    print(f"Running on device: {DEVICE}")
     ingest_documents()
